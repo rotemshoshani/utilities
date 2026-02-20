@@ -338,40 +338,44 @@ for (( phase = START_PHASE; phase <= END_PHASE; phase++ )); do
     echo -e "${CYAN}===========================================================${NC}"
 
     # -- Find phase directory --------------------------------------------------
+    needs_planning=false
+    phase_dir=""
     if ! get_phase_dir "$phase"; then
-        echo -e "  ${RED}ERROR: No directory found for phase $phase in $PHASES_DIR${NC}"
-        stopped=true
-        break
+        # No directory yet -- plan-phase will create it
+        needs_planning=true
+    else
+        phase_dir="$PHASE_DIR_RESULT"
+        echo -e "  ${GRAY}Dir: $(basename "$phase_dir")${NC}"
     fi
-    phase_dir="$PHASE_DIR_RESULT"
-    echo -e "  ${GRAY}Dir: $(basename "$phase_dir")${NC}"
 
     # -- Plan phase if needed --------------------------------------------------
-    get_plan_files "$phase_dir"
-    plan_files=("${PLAN_FILES[@]+"${PLAN_FILES[@]}"}")
-    needs_planning=false
+    plan_files=()
+    if [[ -n "$phase_dir" ]]; then
+        get_plan_files "$phase_dir"
+        plan_files=("${PLAN_FILES[@]+"${PLAN_FILES[@]}"}")
 
-    if [[ ${#plan_files[@]} -eq 0 ]]; then
-        needs_planning=true
-    fi
-
-    # If plans exist but NONE have been executed (no summaries), the previous run
-    # planned but never got to execute (e.g. rate limited). Re-plan for fresh context.
-    if ! $needs_planning && [[ ${#plan_files[@]} -gt 0 ]]; then
-        has_any_summary=false
-        for pf in "${plan_files[@]}"; do
-            if test_plan_complete "$phase_dir" "$(basename "$pf")"; then
-                has_any_summary=true
-                break
-            fi
-        done
-        if ! $has_any_summary; then
-            echo -e "  ${YELLOW}Plans exist but none executed - re-planning for fresh context${NC}"
-            for pf in "${plan_files[@]}"; do
-                rm -f "$pf"
-            done
-            plan_files=()
+        if [[ ${#plan_files[@]} -eq 0 ]]; then
             needs_planning=true
+        fi
+
+        # If plans exist but NONE have been executed (no summaries), the previous run
+        # planned but never got to execute (e.g. rate limited). Re-plan for fresh context.
+        if ! $needs_planning && [[ ${#plan_files[@]} -gt 0 ]]; then
+            has_any_summary=false
+            for pf in "${plan_files[@]}"; do
+                if test_plan_complete "$phase_dir" "$(basename "$pf")"; then
+                    has_any_summary=true
+                    break
+                fi
+            done
+            if ! $has_any_summary; then
+                echo -e "  ${YELLOW}Plans exist but none executed - re-planning for fresh context${NC}"
+                for pf in "${plan_files[@]}"; do
+                    rm -f "$pf"
+                done
+                plan_files=()
+                needs_planning=true
+            fi
         fi
     fi
 
@@ -417,8 +421,13 @@ for (( phase = START_PHASE; phase <= END_PHASE; phase++ )); do
         fi
 
         # Re-resolve phase dir (planning may have created a new directory)
-        get_phase_dir "$phase"
+        if ! get_phase_dir "$phase"; then
+            echo -e "    ${RED}ERROR: No directory found after planning phase $phase${NC}"
+            stopped=true
+            break
+        fi
         phase_dir="$PHASE_DIR_RESULT"
+        echo -e "  ${GRAY}Dir: $(basename "$phase_dir")${NC}"
         get_plan_files "$phase_dir"
         plan_files=("${PLAN_FILES[@]+"${PLAN_FILES[@]}"}")
         if [[ ${#plan_files[@]} -eq 0 ]]; then
