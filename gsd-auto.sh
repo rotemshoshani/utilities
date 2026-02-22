@@ -358,25 +358,7 @@ for (( phase = START_PHASE; phase <= END_PHASE; phase++ )); do
             needs_planning=true
         fi
 
-        # If plans exist but NONE have been executed (no summaries), the previous run
-        # planned but never got to execute (e.g. rate limited). Re-plan for fresh context.
-        if ! $needs_planning && [[ ${#plan_files[@]} -gt 0 ]]; then
-            has_any_summary=false
-            for pf in "${plan_files[@]}"; do
-                if test_plan_complete "$phase_dir" "$(basename "$pf")"; then
-                    has_any_summary=true
-                    break
-                fi
-            done
-            if ! $has_any_summary; then
-                echo -e "  ${YELLOW}Plans exist but none executed - re-planning for fresh context${NC}"
-                for pf in "${plan_files[@]}"; do
-                    rm -f "$pf"
-                done
-                plan_files=()
-                needs_planning=true
-            fi
-        fi
+        # Plans exist but none executed yet — just use them as-is
     fi
 
     if $needs_planning; then
@@ -391,7 +373,7 @@ for (( phase = START_PHASE; phase <= END_PHASE; phase++ )); do
             continue
         fi
 
-        invoke_claude "/gsd:plan-phase $phase" "phase${phase}-plan"
+        invoke_claude "/gsd:plan-phase $phase -- If CONTEXT.md is missing, proceed without it. Do not ask interactive questions - just plan with whatever context is available." "phase${phase}-plan"
 
         # Check for rate limits first — must stop immediately
         if test_rate_limit "$INVOKE_OUTPUT"; then
@@ -476,7 +458,7 @@ for (( phase = START_PHASE; phase <= END_PHASE; phase++ )); do
             echo -e "    ${YELLOW}This plan has a checkpoint that needs interactive execution.${NC}"
             echo -e "    ${WHITE}Run it in a Claude Code instance:${NC}"
             echo ""
-            echo -e "    ${CYAN}/gsd:execute-plan $relative_path${NC}"
+            echo -e "    ${CYAN}/gsd:execute-phase $phase${NC}"
             echo ""
             echo -e "    ${WHITE}Then re-run gsd-auto to continue from where it left off.${NC}"
             send_toast "GSD Auto - Interactive Plan" "$plan_name needs interactive execution"
@@ -493,7 +475,7 @@ for (( phase = START_PHASE; phase <= END_PHASE; phase++ )); do
             continue
         fi
 
-        invoke_claude "/gsd:execute-plan $relative_path" "phase${phase}-${plan_basename}"
+        invoke_claude "Read and follow the execution workflow at /home/rshoshani/.claude/get-shit-done/workflows/execute-plan.md to execute the plan at $relative_path. Run in autonomous/yolo mode - do not ask interactive questions, proceed automatically. CRITICAL: Execute ONLY this specific plan ($plan_name). After creating its SUMMARY.md and committing metadata, STOP. Do NOT auto-continue to the next plan -- the outer automation handles plan sequencing." "phase${phase}-${plan_basename}"
 
         # Check for rate limits first — must stop immediately
         if test_rate_limit "$INVOKE_OUTPUT"; then
