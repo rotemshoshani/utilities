@@ -375,13 +375,17 @@ for (( phase = START_PHASE; phase <= END_PHASE; phase++ )); do
 
         invoke_claude "/gsd:plan-phase $phase -- If CONTEXT.md is missing, proceed without it. Do not ask interactive questions - just plan with whatever context is available." "phase${phase}-plan"
 
-        # Check for rate limits first — must stop immediately
+        # Check for rate limits — but only stop if planning didn't actually produce plans
         if test_rate_limit "$INVOKE_OUTPUT"; then
-            echo -e "    ${RED}RATE LIMITED - planning phase $phase hit API limit${NC}"
-            echo -e "    ${YELLOW}Wait for rate limit to reset, then re-run.${NC}"
-            send_toast "GSD Auto - Rate Limited" "API limit hit during planning phase $phase"
-            stopped=true
-            break
+            if get_phase_dir "$phase" && get_plan_files "$PHASE_DIR_RESULT" && [[ ${#PLAN_FILES[@]} -gt 0 ]]; then
+                echo -e "    ${YELLOW}Rate limit hit, but plan files exist — planning completed successfully.${NC}"
+            else
+                echo -e "    ${RED}RATE LIMITED - planning phase $phase hit API limit${NC}"
+                echo -e "    ${YELLOW}Wait for rate limit to reset, then re-run.${NC}"
+                send_toast "GSD Auto - Rate Limited" "API limit hit during planning phase $phase"
+                stopped=true
+                break
+            fi
         fi
 
         if [[ "$INVOKE_EXIT_CODE" -ne 0 ]]; then
@@ -477,14 +481,18 @@ for (( phase = START_PHASE; phase <= END_PHASE; phase++ )); do
 
         invoke_claude "Read and follow the execution workflow at /home/rshoshani/.claude/get-shit-done/workflows/execute-plan.md to execute the plan at $relative_path. Run in autonomous/yolo mode - do not ask interactive questions, proceed automatically. CRITICAL: Execute ONLY this specific plan ($plan_name). After creating its SUMMARY.md and committing metadata, STOP. Do NOT auto-continue to the next plan -- the outer automation handles plan sequencing." "phase${phase}-${plan_basename}"
 
-        # Check for rate limits first — must stop immediately
+        # Check for rate limits — but only stop if the plan didn't actually complete
         if test_rate_limit "$INVOKE_OUTPUT"; then
-            echo -e "    ${RED}RATE LIMITED - execution hit API limit${NC}"
-            echo -e "    ${YELLOW}Wait for rate limit to reset, then re-run.${NC}"
-            echo -e "    ${YELLOW}Will resume from $plan_name.${NC}"
-            send_toast "GSD Auto - Rate Limited" "API limit hit during $plan_name"
-            stopped=true
-            break
+            if test_plan_complete "$phase_dir" "$plan_name"; then
+                echo -e "    ${YELLOW}Rate limit hit, but SUMMARY.md exists — plan completed successfully.${NC}"
+            else
+                echo -e "    ${RED}RATE LIMITED - execution hit API limit${NC}"
+                echo -e "    ${YELLOW}Wait for rate limit to reset, then re-run.${NC}"
+                echo -e "    ${YELLOW}Will resume from $plan_name.${NC}"
+                send_toast "GSD Auto - Rate Limited" "API limit hit during $plan_name"
+                stopped=true
+                break
+            fi
         fi
 
         if [[ "$INVOKE_EXIT_CODE" -ne 0 ]]; then

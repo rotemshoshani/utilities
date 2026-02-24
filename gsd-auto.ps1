@@ -286,13 +286,19 @@ for ($phase = $StartPhase; $phase -le $EndPhase; $phase++) {
 
         $result = Invoke-Claude "/gsd:plan-phase $phase" "phase$phase-plan"
 
-        # Check for rate limits first — must stop immediately
+        # Check for rate limits — but only stop if planning didn't actually produce plans
         if (Test-RateLimit $result.Output) {
-            Write-Host "    RATE LIMITED - planning phase $phase hit API limit" -ForegroundColor Red
-            Write-Host "    Wait for rate limit to reset, then re-run." -ForegroundColor Yellow
-            Send-Toast "GSD Auto - Rate Limited" "API limit hit during planning phase $phase"
-            $stopped = $true
-            break
+            $checkDir = Get-PhaseDir $phase
+            $checkPlans = if ($checkDir) { Get-PlanFiles $checkDir.FullName } else { @() }
+            if ($checkPlans.Count -gt 0) {
+                Write-Host "    Rate limit hit, but plan files exist — planning completed successfully." -ForegroundColor Yellow
+            } else {
+                Write-Host "    RATE LIMITED - planning phase $phase hit API limit" -ForegroundColor Red
+                Write-Host "    Wait for rate limit to reset, then re-run." -ForegroundColor Yellow
+                Send-Toast "GSD Auto - Rate Limited" "API limit hit during planning phase $phase"
+                $stopped = $true
+                break
+            }
         }
 
         if ($result.ExitCode -and $result.ExitCode -ne 0) {
@@ -380,14 +386,18 @@ for ($phase = $StartPhase; $phase -le $EndPhase; $phase++) {
 
         $result = Invoke-Claude "/gsd:execute-plan $relativePath" "phase$phase-$($plan.BaseName)"
 
-        # Check for rate limits first — must stop immediately
+        # Check for rate limits — but only stop if the plan didn't actually complete
         if (Test-RateLimit $result.Output) {
-            Write-Host "    RATE LIMITED - execution hit API limit" -ForegroundColor Red
-            Write-Host "    Wait for rate limit to reset, then re-run." -ForegroundColor Yellow
-            Write-Host "    Will resume from $($plan.Name)." -ForegroundColor Yellow
-            Send-Toast "GSD Auto - Rate Limited" "API limit hit during $($plan.Name)"
-            $stopped = $true
-            break
+            if (Test-PlanComplete $phaseDir.FullName $plan.Name) {
+                Write-Host "    Rate limit hit, but SUMMARY.md exists — plan completed successfully." -ForegroundColor Yellow
+            } else {
+                Write-Host "    RATE LIMITED - execution hit API limit" -ForegroundColor Red
+                Write-Host "    Wait for rate limit to reset, then re-run." -ForegroundColor Yellow
+                Write-Host "    Will resume from $($plan.Name)." -ForegroundColor Yellow
+                Send-Toast "GSD Auto - Rate Limited" "API limit hit during $($plan.Name)"
+                $stopped = $true
+                break
+            }
         }
 
         if ($result.ExitCode -and $result.ExitCode -ne 0) {
