@@ -2,12 +2,18 @@
 
 Hands-free runner for the [GSD framework](https://www.npmjs.com/package/get-shit-done-cc) in Claude Code. Give it a range of phases and walk away — it plans, executes, and commits everything automatically, only stopping when it actually needs you (checkpoints, verification, decisions). Each plan runs in a fresh `claude -p` call so context never gets stale.
 
+```bash
+# Linux
+gsd-auto run 5 8                     # Plan + execute phases 5 through 8
+gsd-auto run 5                       # Run just phase 5
+gsd-auto run                         # Interactive phase picker (fzf)
+gsd-auto status                      # Phase progress table
+```
+
 ```powershell
-.\gsd-auto.ps1 5 8                    # Plan + execute phases 5 through 8
-.\gsd-auto.ps1 12 12                  # Finish phase 12 (skips completed plans)
-.\gsd-auto.ps1 5 8 -DryRun            # Preview what would run
-.\gsd-auto.ps1 5 8 -ProjectDir "C:\"  # Explicit project path
-.\gsd-auto.ps1 5 8 -Push              # Auto commit + push when done
+# Windows
+.\gsd-auto.ps1 5 8                   # Plan + execute phases 5 through 8
+.\gsd-auto.ps1 12 12                 # Finish phase 12 (skips completed plans)
 ```
 
 ---
@@ -16,34 +22,29 @@ Hands-free runner for the [GSD framework](https://www.npmjs.com/package/get-shit
 
 ### 1. Prerequisites
 
-- **Windows** with PowerShell 5.1+
+- **Linux**: Bash 4+. Optional: [fzf](https://github.com/junegunn/fzf) for interactive phase picker
+- **Windows**: PowerShell 5.1+
 - **[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)** installed and in your PATH (`claude` must work from any terminal)
 - **[GSD framework](https://www.npmjs.com/package/get-shit-done-cc)** installed in your project
 - A GSD project with `.planning/` already initialized (at minimum: `PROJECT.md` and `ROADMAP.md` created via `/gsd:new-project` and `/gsd:create-roadmap`)
 
 ### 2. Get the script
 
-```powershell
+```bash
 git clone https://github.com/rotemshoshani/gsd-auto.git
 ```
 
-Place `gsd-auto.ps1` wherever you like:
+Place the script wherever you like:
 
-```powershell
-# Option A: In your project root
-copy gsd-auto\gsd-auto.ps1 C:\path\to\your\project\
+```bash
+# Option A: Symlink to your PATH
+ln -s ~/projects/gsd-auto/gsd-auto.sh ~/bin/gsd-auto
 
-# Option B: Central location, reuse across projects
-copy gsd-auto\gsd-auto.ps1 C:\Tools\gsd-auto\
+# Option B: Copy to your project root
+cp gsd-auto/gsd-auto.sh /path/to/your/project/
 ```
 
-### 3. Allow script execution (one-time)
-
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
-```
-
-### 4. Enable skip-permissions flag (one-time)
+### 3. Enable skip-permissions flag (one-time)
 
 The script runs `claude -p` with `--dangerously-skip-permissions` for non-interactive execution. Add this to your project's `.claude/settings.json`:
 
@@ -53,6 +54,12 @@ The script runs `claude -p` with `--dangerously-skip-permissions` for non-intera
 
 > **Note:** This bypasses all Claude Code permission prompts. Only use in projects you trust.
 
+### 4. Windows: Allow script execution (one-time)
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+```
+
 ### 5. GSD config for automation
 
 Set your `.planning/config.json` to skip GSD's workflow confirmations (which can't be answered in non-interactive `claude -p` sessions):
@@ -60,6 +67,125 @@ Set your `.planning/config.json` to skip GSD's workflow confirmations (which can
 ```json
 { "mode": "yolo" }
 ```
+
+---
+
+## Commands (Linux)
+
+| Command | Description |
+|---------|-------------|
+| `gsd-auto run [start] [end] [opts]` | Run phases (fzf picker if no args) |
+| `gsd-auto run 5` | Run just phase 5 |
+| `gsd-auto run 5 8` | Run phases 5 through 8 |
+| `gsd-auto stop [--project-dir DIR]` | Write the stop file |
+| `gsd-auto status [--project-dir DIR]` | Show phase progress table |
+| `gsd-auto logs [--project-dir DIR]` | List recent logs |
+| `gsd-auto logs -f` | Tail the most recent log |
+| `gsd-auto help` | Show help |
+
+### Run options
+
+| Flag | Description |
+|------|-------------|
+| `--project-dir DIR` | Project root (default: current directory) |
+| `--dry-run` | Preview what would run without executing |
+| `--push` | Auto commit + push all changes when done |
+
+### Backward compatibility
+
+If the first argument is a number, it's treated as `run`:
+
+```bash
+gsd-auto 5 8              # Same as: gsd-auto run 5 8
+gsd-auto 5 8 --dry-run    # Same as: gsd-auto run 5 8 --dry-run
+```
+
+---
+
+## Stopping a run
+
+### Linux: Ctrl+C (recommended)
+
+- **First Ctrl+C** — sets a graceful stop flag. The current `claude -p` call finishes naturally, then the runner stops.
+- **Second Ctrl+C** — force kills the running claude process and exits immediately.
+
+The runner protects the claude subprocess from SIGINT, so Ctrl+C never corrupts a running plan — it always either finishes cleanly or is force-killed.
+
+### From another terminal
+
+```bash
+gsd-auto stop                            # From the project root
+gsd-auto stop --project-dir /my/project  # Explicit path
+```
+
+This writes the stop file (`.planning/STOP`). The runner checks for it before each plan and halts cleanly.
+
+### Windows
+
+Open another terminal and run:
+
+```powershell
+echo stop > .planning\STOP
+```
+
+---
+
+## Interactive phase picker (fzf)
+
+When `gsd-auto run` is called without phase numbers, it launches an fzf picker showing all phases with their status:
+
+```
+  >>  06-dashboard                  1/3 plans
+  ..  07-notifications              0/2 plans
+  --  08-deployment                 (no plans)
+```
+
+- Select **1 phase** to run just that phase
+- Select **2 phases** (TAB to multi-select) to run a start..end range
+- The preview pane shows plan files and completion status
+
+Requires [fzf](https://github.com/junegunn/fzf). Falls back to an error with install instructions if not found.
+
+---
+
+## Status
+
+```bash
+gsd-auto status
+```
+
+Shows a quick progress table:
+
+```
+  Phase Status  (/home/user/projects/myapp)
+
+    OK  05-authentication           3/3 plans
+    >>  06-dashboard                1/3 plans
+    ..  07-notifications            0/2 plans
+    --  08-deployment               (no plans)
+
+  Legend:  OK = complete  >> = in progress  .. = not started  -- = no plans
+```
+
+---
+
+## Logs
+
+```bash
+gsd-auto logs           # List recent log files
+gsd-auto logs -f        # Tail the most recent log (live output)
+```
+
+Every `claude -p` invocation is logged to `.planning/logs/auto/` inside your project:
+
+```
+.planning/logs/auto/
+  phase5-plan-143022.log           # Planning output
+  phase5-05-01-PLAN-143510.log     # Execution output per plan
+  phase5-05-02-PLAN-144230.log
+```
+
+> **Security note:** Log files contain the full Claude output, which may include snippets of your source code, environment variables, or config values that Claude read during execution. Make sure `.planning/logs/` is in your project's `.gitignore` so logs are never committed.
 
 ---
 
@@ -108,7 +234,7 @@ The script scans every `claude -p` output for these patterns that GSD uses to si
 When any pattern matches, the script:
 1. Shows which pattern triggered the pause
 2. Points you to the log file with the full Claude output
-3. Sends a Windows toast notification (so you can walk away and get notified)
+3. Sends a desktop notification (so you can walk away and get notified)
 4. Waits for input: **Enter** to continue, **stop** to abort
 
 ### Checkpoint plans are detected before execution
@@ -128,41 +254,9 @@ When it finds a checkpoint plan, it **stops and tells you** to run it interactiv
     Then re-run gsd-auto to continue from where it left off.
 ```
 
-**The workflow:**
-1. The script stops (no wasted `claude -p` call)
-2. Open a Claude Code instance and run the command it gives you
-3. In the interactive session, Claude executes the auto tasks, presents the checkpoint, and you can approve/request fixes with full conversation context
-4. After the plan completes (SUMMARY.md created), re-run gsd-auto — it skips everything already done and picks up at the next plan
-
-### Logs
-
-Every `claude -p` invocation is logged to `.planning/logs/auto/` inside your project:
-
-```
-.planning/logs/auto/
-  phase5-plan-143022.log           # Planning output
-  phase5-05-01-PLAN-143510.log     # Execution output per plan
-  phase5-05-02-PLAN-144230.log
-  ...
-```
-
-> **Security note:** Log files contain the full Claude output, which may include snippets of your source code, environment variables, or config values that Claude read during execution. Make sure `.planning/logs/` is in your project's `.gitignore` so logs are never committed. A sample `.gitignore` is included in this repo — copy the relevant lines into your project.
-
 ### Safe to re-run
 
 The script checks for `SUMMARY.md` to determine if a plan is complete. If you re-run the same phase range, completed plans are skipped automatically. This means you can safely restart after a crash, an abort, or a checkpoint pause.
-
----
-
-## Parameters
-
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `StartPhase` | Yes | First phase number to process |
-| `EndPhase` | Yes | Last phase number to process (inclusive) |
-| `-ProjectDir` | No | Path to GSD project root. Defaults to current directory |
-| `-DryRun` | No | Preview what would run without executing anything |
-| `-Push` | No | Auto commit and push all changes when the run finishes |
 
 ---
 
@@ -173,8 +267,8 @@ The script checks for `SUMMARY.md` to determine if a plan is complete. If you re
   ===============
   Phases:   5 -> 8
   Model:    opus
-  Project:  C:\Users\admin\projects\myapp
-  Stop:     echo stop > .planning\STOP  (from project root)
+  Project:  /home/user/projects/myapp
+  Stop:     Ctrl+C (or: gsd-auto stop)
 
 ===========================================================
   PHASE 5
@@ -184,7 +278,7 @@ The script checks for `SUMMARY.md` to determine if a plan is complete. If you re
 
   [1/3] 14:35:10  Executing 05-01-PLAN.md...
     /gsd:execute-plan .planning/phases/05-authentication/05-01-PLAN.md
-    Log: .planning\logs\auto\phase5-05-01-PLAN-143510.log
+    Log: .planning/logs/auto/phase5-05-01-PLAN-143510.log
     Done. SUMMARY.md created.
 
   [2/3] 14:42:30  05-02-PLAN.md requires human verification
@@ -192,13 +286,13 @@ The script checks for `SUMMARY.md` to determine if a plan is complete. If you re
     This plan has a checkpoint that needs interactive execution.
     Run it in a Claude Code instance:
 
-    /gsd:execute-plan .planning/phases/05-authentication/05-02-PLAN.md
+    /gsd:execute-phase 5
 
     Then re-run gsd-auto to continue from where it left off.
 
 ===========================================================
   Stopped after 2 steps (00:12:08)
-  Logs: .planning\logs\auto
+  Logs: .planning/logs/auto
 ===========================================================
 ```
 
@@ -213,26 +307,11 @@ After running the plan interactively and re-running gsd-auto:
 
 ---
 
-## Stopping a run
-
-To stop gracefully after the current plan finishes, open another terminal, `cd` to the same project root, and run:
-
-```powershell
-echo stop > .planning\STOP
-```
-
-The script checks for this file before each plan. When found, it deletes the file and halts cleanly. Since the path is relative to the project, you can run gsd-auto on multiple projects simultaneously and stop them independently.
-
-The stop hint is also shown in the startup banner as a reminder.
-
----
-
 ## Auto commit + push
 
-Add `-Push` to automatically commit and push all changes when the run finishes:
-
-```powershell
-.\gsd-auto.ps1 5 8 -Push
+```bash
+gsd-auto run 5 8 --push              # Linux
+.\gsd-auto.ps1 5 8 -Push             # Windows
 ```
 
 When the run ends (whether all phases complete or it stops early), the script will:
@@ -245,8 +324,19 @@ The commit/push is skipped if there are no changes, if it was a dry run, or if z
 
 ---
 
+## Windows parameters
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `StartPhase` | Yes | First phase number to process |
+| `EndPhase` | Yes | Last phase number to process (inclusive) |
+| `-ProjectDir` | No | Path to GSD project root. Defaults to current directory |
+| `-DryRun` | No | Preview what would run without executing anything |
+| `-Push` | No | Auto commit and push all changes when the run finishes |
+
+---
+
 ## Limitations
 
-- **Windows only** — uses Windows toast notifications. The core logic works on any OS if you remove the `Send-Toast` function.
 - **Sequential execution** — runs one plan at a time. For parallel execution within a phase, use `/gsd:execute-phase` directly in Claude Code.
 - **Checkpoint plans require a separate step** — plans with `autonomous: false` are detected before execution and the script stops, telling you to run them interactively in Claude Code. Re-run gsd-auto afterward to continue.
