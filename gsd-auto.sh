@@ -226,6 +226,11 @@ RATE_LIMIT_PATTERNS=(
     "429"
 )
 
+# Known Claude Code bug — agent reports failure but work completed successfully
+FALSE_FAILURE_PATTERNS=(
+    "classifyHandoffIfNeeded is not defined"
+)
+
 # -- Global return values for invoke_claude ------------------------------------
 
 INVOKE_OUTPUT=""
@@ -300,6 +305,16 @@ test_rate_limit() {
     return 1
 }
 
+test_false_failure() {
+    local output="$1"
+    for pattern in "${FALSE_FAILURE_PATTERNS[@]}"; do
+        if echo "$output" | grep -qF "$pattern"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 test_stop_requested() {
     if [[ -f "$STOP_FILE" ]]; then
         rm -f "$STOP_FILE"
@@ -318,7 +333,9 @@ get_phase_dir() {
     done < <(find "$PHASES_DIR" -maxdepth 1 -type d | while IFS= read -r d; do
         local name
         name="$(basename "$d")"
-        if [[ "$name" =~ ^0*${phase_num}- ]]; then
+        # Escape dots in phase_num for regex (e.g., "1.1" → "1\.1")
+        local escaped_num="${phase_num//./\\.}"
+        if [[ "$name" =~ ^0*${escaped_num}- ]]; then
             echo "$d"
         fi
     done | sort)
@@ -419,6 +436,7 @@ DISP_PLANS=()          # Plan filenames
 DISP_STATUSES=()       # "done" | "running" | "pending" | "skip"
 DISP_MODE=""           # "planning" | "executing" | "complete" | ""
 DISP_PAUSED=false      # When true, draw_display is a no-op
+DISP_COMPLETED=()      # Trail of completed phase labels ("55 ✓", "56 ✓", ...)
 
 # Timer PID for periodic refresh
 DISP_TIMER_PID=""
@@ -458,6 +476,17 @@ draw_display() {
     $DRY_RUN && info="$info  ${YELLOW}· DRY RUN${NC}"
     _dl "  $info"
     _dl ""
+
+    # Completed phases trail
+    if [[ ${#DISP_COMPLETED[@]} -gt 0 ]]; then
+        local trail=""
+        for entry in "${DISP_COMPLETED[@]}"; do
+            [[ -n "$trail" ]] && trail="$trail  "
+            trail="${trail}${GREEN}${entry}${NC}"
+        done
+        _dl "  $trail"
+        _dl ""
+    fi
 
     # Phase section
     if [[ -n "$DISP_PHASE" ]]; then
@@ -747,9 +776,9 @@ cmd_run() {
         fzf_pick_phases
     fi
 
-    # Validate
-    if ! [[ "$START_PHASE" =~ ^[0-9]+$ ]] || ! [[ "$END_PHASE" =~ ^[0-9]+$ ]]; then
-        echo -e "  ${RED}ERROR: Phase numbers must be integers${NC}" >&2
+    # Validate (allow decimal phases like 1.1)
+    if ! [[ "$START_PHASE" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! [[ "$END_PHASE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo -e "  ${RED}ERROR: Phase numbers must be numbers (e.g., 5, 5.1)${NC}" >&2
         exit 1
     fi
 
@@ -769,6 +798,7 @@ cmd_run() {
     DISP_STATUSES=()
     DISP_MODE=""
     DISP_PAUSED=false
+    DISP_COMPLETED=()
     RUN_START_TIME=$SECONDS
 
     # -- Signal handling -------------------------------------------------------
@@ -800,6 +830,10 @@ cmd_run() {
     mkdir -p "$LOG_DIR"
     start_sleep_prevention
     start_display_timer
+
+    # Disable auto-advance to prevent plan-phase from chaining into execute-phase
+    # (gsd-auto handles execution sequencing itself)
+    ( cd "$PROJECT_DIR" && node "$HOME/.claude/get-shit-done/bin/gsd-tools.cjs" config-set workflow._auto_chain_active false 2>/dev/null ) || true
 
     local total_steps=0
     local stopped=false
@@ -858,7 +892,7 @@ cmd_run() {
                 continue
             fi
 
-            invoke_claude "/gsd:plan-phase $phase -- If CONTEXT.md is missing, proceed without it. Do not ask interactive questions - just plan with whatever context is available." "phase${phase}-plan"
+            invoke_claude "/gsd:plan-phase $phase --skip-research -- If CONTEXT.md is missing, proceed without it. Do not ask interactive questions - just plan with whatever context is available." "phase${phase}-plan"
 
             # Check for rate limits
             if test_rate_limit "$INVOKE_OUTPUT"; then
@@ -875,7 +909,7 @@ cmd_run() {
                 fi
             fi
 
-            if [[ "$INVOKE_EXIT_CODE" -ne 0 ]]; then
+            if [[ "$INVOKE_EXIT_CODE" -ne 0 ]] && ! test_false_failure "$INVOKE_OUTPUT"; then
                 pause_display
                 echo ""
                 echo -e "    ${RED}ERROR: plan-phase exited with code $INVOKE_EXIT_CODE${NC}"
@@ -989,7 +1023,40 @@ cmd_run() {
                 continue
             fi
 
-            invoke_claude "Read and follow the execution workflow at /home/rshoshani/.claude/get-shit-done/workflows/execute-plan.md to execute the plan at $relative_path. Run in autonomous/yolo mode - do not ask interactive questions, proceed automatically. CRITICAL: Execute ONLY this specific plan ($plan_name). After creating its SUMMARY.md and committing metadata, STOP. Do NOT auto-continue to the next plan -- the outer automation handles plan sequencing." "phase${phase}-${plan_basename}"
+            local phase_dir_name
+            phase_dir_name="$(basename "$phase_dir")"
+            local phase_slug="${phase_dir_name#*-}"
+
+            invoke_claude "
+<objective>
+Execute plan ${plan_name} of phase ${phase}-${phase_slug}.
+Commit each task atomically. Create SUMMARY.md. Update STATE.md and ROADMAP.md.
+CRITICAL: Execute ONLY this specific plan (${plan_name}). After creating its SUMMARY.md and committing metadata, STOP. Do NOT auto-continue to the next plan -- the outer automation handles plan sequencing.
+</objective>
+
+<execution_context>
+@/home/rshoshani/.claude/get-shit-done/workflows/execute-plan.md
+@/home/rshoshani/.claude/get-shit-done/templates/summary.md
+@/home/rshoshani/.claude/get-shit-done/references/checkpoints.md
+@/home/rshoshani/.claude/get-shit-done/references/tdd.md
+</execution_context>
+
+<files_to_read>
+Read these files at execution start using the Read tool:
+- ${relative_path} (Plan)
+- .planning/STATE.md (State)
+- .planning/config.json (Config, if exists)
+- ./CLAUDE.md (Project instructions, if exists)
+</files_to_read>
+
+<success_criteria>
+- [ ] All tasks executed
+- [ ] Each task committed individually
+- [ ] SUMMARY.md created in plan directory
+- [ ] STATE.md updated with position and decisions
+- [ ] ROADMAP.md updated with plan progress (via roadmap update-plan-progress)
+</success_criteria>
+" "phase${phase}-${plan_basename}"
 
             # If Ctrl+C was pressed during execution, stop immediately
             if $GRACEFUL_STOP_REQUESTED; then
@@ -1014,7 +1081,7 @@ cmd_run() {
                 fi
             fi
 
-            if [[ "$INVOKE_EXIT_CODE" -ne 0 ]]; then
+            if [[ "$INVOKE_EXIT_CODE" -ne 0 ]] && ! test_false_failure "$INVOKE_OUTPUT"; then
                 pause_display
                 echo ""
                 echo -e "    ${RED}ERROR: execute-plan exited with code $INVOKE_EXIT_CODE${NC}"
@@ -1057,6 +1124,16 @@ cmd_run() {
         done
 
         if ! $stopped; then
+            # Check if any work was actually done (vs all plans pre-completed)
+            local any_ran=false
+            for s in "${DISP_STATUSES[@]}"; do
+                [[ "$s" == "done" ]] && any_ran=true
+            done
+            if $any_ran; then
+                DISP_COMPLETED+=("Phase $phase ✓")
+            else
+                DISP_COMPLETED+=("Phase $phase ✓ (skip)")
+            fi
             DISP_MODE="complete"
             draw_display
         fi
