@@ -581,7 +581,8 @@ get_phase_info() {
     name="$(basename "$dir")"
 
     local num="${name%%-*}"
-    num=$((10#$num))
+    # Strip leading zeros while preserving decimal phases (e.g., "05.1" → "5.1", "05" → "5")
+    num="$(echo "$num" | sed 's/^0*\([0-9]\)/\1/')"
     PHASE_INFO_NUM=$num
 
     local plan_count=0 completed=0
@@ -709,7 +710,7 @@ PREVIEW
         START_PHASE="${nums[0]}"
         END_PHASE="${nums[0]}"
     elif [[ ${#nums[@]} -eq 2 ]]; then
-        if [[ ${nums[0]} -le ${nums[1]} ]]; then
+        if awk "BEGIN { exit !(${nums[0]} + 0 <= ${nums[1]} + 0) }"; then
             START_PHASE="${nums[0]}"
             END_PHASE="${nums[1]}"
         else
@@ -841,8 +842,51 @@ cmd_run() {
     # Initial display
     draw_display
 
+    # -- Enumerate phases in range ---------------------------------------------
+    # Discover all phase directories and extract their numeric prefixes.
+    # This handles decimal phases (e.g., 5.1, 5.2) that integer arithmetic can't.
+    local phase_nums=()
+    while IFS= read -r dir; do
+        [[ -z "$dir" ]] && continue
+        local name
+        name="$(basename "$dir")"
+        local num
+        # Extract leading number (possibly decimal) and strip leading zeros
+        num="$(echo "$name" | grep -oE '^[0-9]+(\.[0-9]+)?' | head -1)"
+        [[ -z "$num" ]] && continue
+        num="$(echo "$num" | sed 's/^0*\([0-9]\)/\1/')"
+        # Compare with range using awk (supports decimals)
+        if awk "BEGIN { exit !(($num + 0) >= ($START_PHASE + 0) && ($num + 0) <= ($END_PHASE + 0)) }"; then
+            phase_nums+=("$num")
+        fi
+    done < <(find "$PHASES_DIR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
+
+    # Also add integer phases in range that don't have directories yet (need planning)
+    # Only for integer phases — decimal phases must already have directories
+    if [[ "$START_PHASE" =~ ^[0-9]+$ ]] && [[ "$END_PHASE" =~ ^[0-9]+$ ]]; then
+        for (( i = START_PHASE; i <= END_PHASE; i++ )); do
+            local found=false
+            for existing in "${phase_nums[@]+"${phase_nums[@]}"}"; do
+                # Compare as integers (strip decimal, but only exact integer match)
+                if [[ "$existing" == "$i" ]]; then
+                    found=true
+                    break
+                fi
+            done
+            if ! $found; then
+                phase_nums+=("$i")
+            fi
+        done
+    fi
+
+    # Sort phase numbers numerically (supports decimals)
+    local sorted_phases=()
+    while IFS= read -r num; do
+        [[ -n "$num" ]] && sorted_phases+=("$num")
+    done < <(printf '%s\n' "${phase_nums[@]+"${phase_nums[@]}"}" | sort -t. -k1,1n -k2,2n | uniq)
+
     # -- Main phase loop -------------------------------------------------------
-    for (( phase = START_PHASE; phase <= END_PHASE; phase++ )); do
+    for phase in "${sorted_phases[@]}"; do
         if $stopped; then break; fi
 
         # Check for stop signal (Ctrl+C or file)
