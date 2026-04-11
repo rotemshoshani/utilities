@@ -10,3 +10,7 @@
 
 # Stop signal file (transient)
 .planning/STOP
+
+# Environment variables / API keys
+.env.local
+.env
