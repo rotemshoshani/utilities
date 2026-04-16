@@ -1,4 +1,5 @@
-OPENAI_API_KEY=$(grep "^OPENAI_API_KEY=" ~/projects/gsd-auto/.env.local | cut -d '=' -f 2-)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OPENAI_API_KEY=$(grep "^OPENAI_API_KEY=" "$SCRIPT_DIR/.env.local" | cut -d '=' -f 2-)
 
 project=$(basename $(pwd))
 tmux_name="gsd-auto-${project}"
