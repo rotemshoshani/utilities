@@ -15,11 +15,11 @@ The presence of /clear in the output means the step completed successfully. Your
 
 Rules:
 - Return ONLY one of these three things, nothing else:
-  1. /gsd-plan-phase N --research (where N is the phase number you see in the output)
+  1. /gsd-plan-phase N --research --prd .planning/ROADMAP.md (where N is the phase number you see in the output)
   2. /gsd-execute-phase N (where N is the phase number)
   3. The word DONE (if all phases are complete)
 - The output often suggests multiple commands with different flags. Pick ONLY /gsd-plan-phase or /gsd-execute-phase. Ignore suggestions for /gsd-ui-phase, /gsd-discuss-phase, /gsd-list-phase-assumptions, etc.
-- /gsd-plan-phase must always include --research
+- /gsd-plan-phase must always include --research and --prd .planning/ROADMAP.md
 - Never explain, never add quotes, never add markdown. Return the command and nothing else.
 - Ignore the CLI status bar and prompt lines at the bottom (lines with symbols like ❯, ⏵, ░, etc.)
 - If you truly cannot determine a next phase command, return DONE

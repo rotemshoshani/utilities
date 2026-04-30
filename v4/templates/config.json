@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "session": {
+    "tmuxSessionName": "gsd-auto-{project}",
+    "claudeLaunchCommand": "claude --dangerously-skip-permissions --model default",
+    "paneCaptureLines": 250,
+    "pollIntervalSeconds": 5,
+    "idleStabilityPolls": 3,
+    "logLevel": "info",
+    "logPerPollClassifier": false,
+    "clearToMajorDelaySeconds": 1.5,
+    "maxIdenticalMajorCommands": 2,
+    "inputBoxScanLines": 5,
+    "menuMaxNavigationSteps": 40,
+    "menuKeyDelaySeconds": 0.1
+  },
+  "commands": {
+    "clear": "/clear",
+    "plan": {
+      "withResearch": "/gsd-plan-phase {phase} --research --prd {prd}",
+      "withoutResearch": "/gsd-plan-phase {phase} --prd {prd}"
+    },
+    "execute": {
+      "default": "/gsd-execute-phase {phase}"
+    },
+    "continue": "continue"
+  },
+  "project": {
+    "prdPath": ".planning/ROADMAP.md"
+  },
+  "policy": {
+    "defaultPlanMode": "without_research",
+    "clearBeforeMajorCommand": true,
+    "deferVerificationToMilestoneEnd": true,
+    "verificationDeferralText": "defer to end of milestone verification",
+    "allowLlmFallback": false,
+    "llmFallbackAllowedTexts": [
+      "continue",
+      "y",
+      "n",
+      "yes",
+      "no",
+      "defer to end of milestone verification",
+      "approve",
+      "fix the bug now"
+    ],
+    "usageResetWaitMinutes": 15,
+    "maxUsageResetAttempts": 32
+  },
+  "patterns": {
+    "busyMarkers": [
+      "esc to interrupt",
+      "Crafting",
+      "Working",
+      "Bashing",
+      "Reading",
+      "Thinking"
+    ],
+    "menuNavFooter": [
+      "Enter to select",
+      "↑/↓ to navigate",
+      "Esc to cancel"
+    ],
+    "inputBoxBorderChars": ["╭", "╰", "│"],
+    "usageLimit": [
+      "usage limit",
+      "no usage remains",
+      "wait for usage to reset"
+    ],
+    "waitForResetOption": [
+      "wait for usage to reset",
+      "Wait for reset"
+    ],
+    "verificationRequest": [
+      "verification required",
+      "please confirm",
+      "manual UAT",
+      "please test"
+    ],
+    "planningComplete": [
+      "GSD ► PHASE (\\d+(?:\\.\\d+)?) PLANNED"
+    ],
+    "executionComplete": [
+      "Phase (\\d+(?:\\.\\d+)?): .+ — Complete",
+      "Pending items tracked"
+    ],
+    "nextPhaseAfterExecute": [
+      "▶ Next Up — Phase (\\d+(?:\\.\\d+)?)"
+    ]
+  }
+}

@@ -1,0 +1,1252 @@
+#!/usr/bin/env python3
+"""gsd-auto v4 — terminal-native automation controller for GSD workflows."""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import datetime as dt
+import enum
+import hashlib
+import json
+import logging
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+SCRIPT_PATH = pathlib.Path(__file__).resolve()
+SCRIPT_DIR = SCRIPT_PATH.parent
+TEMPLATE_CONFIG = SCRIPT_DIR / "templates" / "config.json"
+
+CONFIG_REL = pathlib.Path("gsd-auto/config.json")
+RUNTIME_REL = pathlib.Path("gsd-auto/runtime")
+
+TMUX_TIMEOUT_SECONDS = 5
+
+# Defaults for session.* values that are read once at controller start.
+DEFAULT_CLEAR_TO_MAJOR_DELAY = 1.5
+DEFAULT_MAX_IDENTICAL_MAJOR = 2
+DEFAULT_INPUT_BOX_SCAN_LINES = 5
+DEFAULT_MENU_MAX_NAV_STEPS = 40
+DEFAULT_MENU_KEY_DELAY = 0.1
+
+
+def runtime_paths(repo: pathlib.Path) -> dict[str, pathlib.Path]:
+    rt = repo / RUNTIME_REL
+    return {
+        "root": rt,
+        "screens": rt / "screens",
+        "pid": rt / "controller.pid",
+        "state": rt / "state.json",
+        "events": rt / "events.jsonl",
+        "actions": rt / "actions.jsonl",
+        "log": rt / "controller.log",
+        "raw": rt / "last-screen.txt",
+        "norm": rt / "last-screen.normalized.txt",
+        "pause_flag": rt / "pause.flag",
+        "stop_next_flag": rt / "stop-next.flag",
+    }
+
+
+# ---------- Screen normalization ----------
+
+ANSI_CSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+ANSI_OSC_RE = re.compile(r"\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)")
+ANSI_OTHER_RE = re.compile(r"\x1B[@-Z\\\-_]")
+MULTI_SPACE_RE = re.compile(r"[ \t]{2,}")
+
+
+def strip_ansi(text: str) -> str:
+    text = ANSI_CSI_RE.sub("", text)
+    text = ANSI_OSC_RE.sub("", text)
+    text = ANSI_OTHER_RE.sub("", text)
+    return text
+
+
+def normalize_screen(raw: str) -> str:
+    s = strip_ansi(raw)
+    s = s.replace("\r\n", "\n").replace("\r", "")
+    out_lines = []
+    for ln in s.split("\n"):
+        ln = ln.replace("\t", " ")
+        ln = MULTI_SPACE_RE.sub(" ", ln)
+        ln = ln.rstrip()
+        out_lines.append(ln)
+    return "\n".join(out_lines).strip("\n")
+
+
+def screen_hash(normalized: str) -> str:
+    return hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def has_input_box(normalized: str, scan_lines: int = DEFAULT_INPUT_BOX_SCAN_LINES) -> bool:
+    """Detect Claude's input-box by its corner glyphs on a single bottom row.
+
+    Looks for a row in the last `scan_lines` lines that contains both ╰ and ╯
+    (the bottom border) — and as a fallback both ╭ and ╮ (the top border).
+    The bare vertical bar │ is not used: it appears constantly in tool-call
+    boxes, tables, and other agent output and produces false positives.
+    """
+    if scan_lines <= 0:
+        return False
+    lines = normalized.split("\n")
+    for ln in lines[-scan_lines:]:
+        if ("╰" in ln and "╯" in ln) or ("╭" in ln and "╮" in ln):
+            return True
+    return False
+
+
+# ---------- Classifier ----------
+
+class Classifier(enum.Enum):
+    BUSY = "busy"
+    IDLE = "idle"
+    MENU = "menu"
+    TEXT_PROMPT = "text-prompt"
+    USAGE_LIMITED = "usage-limited"
+
+
+def match_patterns(text: str, patterns: list[str], ignore_case: bool = True) -> list[str]:
+    out = []
+    flags = re.IGNORECASE if ignore_case else 0
+    for p in patterns:
+        try:
+            if re.search(p, text, flags):
+                out.append(p)
+        except re.error:
+            t = text.lower() if ignore_case else text
+            n = p.lower() if ignore_case else p
+            if n in t:
+                out.append(p)
+    return out
+
+
+def classify(
+    normalized: str,
+    hash_unstable: bool,
+    patterns: dict,
+    input_box_scan_lines: int = DEFAULT_INPUT_BOX_SCAN_LINES,
+) -> tuple[Classifier, dict]:
+    info: dict = {"matched": []}
+
+    m = match_patterns(normalized, patterns.get("usageLimit", []))
+    if m:
+        info["matched"] = m
+        return Classifier.USAGE_LIMITED, info
+
+    busy_m = match_patterns(normalized, patterns.get("busyMarkers", []))
+    if busy_m or hash_unstable:
+        info["matched"] = busy_m
+        info["hashUnstable"] = hash_unstable
+        return Classifier.BUSY, info
+
+    has_box = has_input_box(normalized, input_box_scan_lines)
+    info["hasInputBox"] = has_box
+    menu_m = match_patterns(normalized, patterns.get("menuNavFooter", []))
+    if not has_box or menu_m:
+        info["matched"] = menu_m
+        return Classifier.MENU, info
+
+    vrf_m = match_patterns(normalized, patterns.get("verificationRequest", []))
+    if vrf_m:
+        info["matched"] = vrf_m
+        return Classifier.TEXT_PROMPT, info
+
+    return Classifier.IDLE, info
+
+
+# ---------- State ----------
+
+class State(enum.Enum):
+    BOOT = "BOOT"
+    SESSION_STARTING = "SESSION_STARTING"
+    RUNNING = "RUNNING"
+    DECISION_REQUIRED = "DECISION_REQUIRED"
+    INTERACTIVE_MENU = "INTERACTIVE_MENU"
+    TEXT_PROMPT = "TEXT_PROMPT"
+    USAGE_LIMITED = "USAGE_LIMITED"
+    WAITING_FOR_RESET = "WAITING_FOR_RESET"
+    PAUSED_FOR_HUMAN = "PAUSED_FOR_HUMAN"
+    COMPLETE = "COMPLETE"
+    ERROR = "ERROR"
+
+
+@dataclasses.dataclass
+class RuntimeState:
+    state: str = State.BOOT.value
+    hasObservedFirstCycle: bool = False
+    lastPhase: str | None = None
+    lastCommandSent: str | None = None
+    lastActionTimestamp: str | None = None
+    retryCounts: dict = dataclasses.field(default_factory=dict)
+    usageResetAttempts: int = 0
+    lastMenuSnapshot: dict | None = None
+    screenHash: str | None = None
+    stableCount: int = 0
+    pollCount: int = 0
+    waitingResetUntil: str | None = None
+
+    def to_json(self) -> dict:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_json(cls, data: dict) -> "RuntimeState":
+        names = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in names})
+
+
+# ---------- Tmux ----------
+
+class Tmux:
+    def __init__(self, session: str):
+        self.session = session
+
+    def has_session(self) -> bool:
+        try:
+            r = subprocess.run(
+                ["tmux", "has-session", "-t", self.session],
+                capture_output=True, timeout=TMUX_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            return False
+        return r.returncode == 0
+
+    def new_session(self, command: str | None = None) -> None:
+        args = ["tmux", "new-session", "-d", "-s", self.session]
+        if command:
+            args.append(command)
+        subprocess.run(args, check=True, timeout=TMUX_TIMEOUT_SECONDS)
+
+    def capture_pane(self, lines: int) -> str:
+        r = subprocess.run(
+            ["tmux", "capture-pane", "-t", self.session, "-p", "-e", "-J", "-S", f"-{lines}"],
+            capture_output=True, text=True, errors="replace",
+            timeout=TMUX_TIMEOUT_SECONDS,
+        )
+        return r.stdout
+
+    def send_keys(self, *keys: str) -> None:
+        subprocess.run(
+            ["tmux", "send-keys", "-t", self.session, *keys],
+            check=True, timeout=TMUX_TIMEOUT_SECONDS,
+        )
+
+    def send_text_enter(self, text: str) -> None:
+        subprocess.run(
+            ["tmux", "send-keys", "-t", self.session, text, "Enter"],
+            check=True, timeout=TMUX_TIMEOUT_SECONDS,
+        )
+
+
+# ---------- Decision policy ----------
+
+def render_command(template: str, *, phase: str | None = None,
+                   prd: str | None = None, project: str | None = None) -> str:
+    out = template
+    if phase is not None:
+        out = out.replace("{phase}", phase)
+    if prd is not None:
+        out = out.replace("{prd}", prd)
+    if project is not None:
+        out = out.replace("{project}", project)
+    return out
+
+
+def steady_state_decision(normalized: str, config: dict) -> dict | None:
+    patterns = config["patterns"]
+
+    for pat in patterns.get("planningComplete", []):
+        try:
+            m = re.search(pat, normalized)
+        except re.error:
+            continue
+        if m:
+            phase = m.group(1) if m.groups() else None
+            return {"rule": "planningComplete", "phase": phase, "next": "execute"}
+
+    exec_match = None
+    for pat in patterns.get("executionComplete", []):
+        try:
+            m = re.search(pat, normalized)
+        except re.error:
+            continue
+        if m:
+            exec_match = m
+            break
+
+    if exec_match:
+        next_phase = None
+        for pat in patterns.get("nextPhaseAfterExecute", []):
+            try:
+                m = re.search(pat, normalized)
+            except re.error:
+                continue
+            if m and m.groups():
+                next_phase = m.group(1)
+                break
+        if next_phase:
+            return {
+                "rule": "executionComplete+nextPhase",
+                "phase": next_phase,
+                "next": "plan",
+            }
+        return {"rule": "executionComplete+noNext", "next": "complete"}
+
+    return None
+
+
+# ---------- Controller ----------
+
+class Controller:
+    def __init__(self, repo: pathlib.Path, config: dict):
+        self.repo = repo
+        self.config = config
+        self.paths = runtime_paths(repo)
+        self.session_name = config["session"]["tmuxSessionName"].replace("{project}", repo.name)
+        self.tmux = Tmux(self.session_name)
+        self.state = self._load_state()
+        self.logger = self._setup_logger()
+        self.last_hash: str | None = self.state.screenHash
+        self.stable_count = self.state.stableCount or 0
+
+        # Tunables read once at start; do not re-read each call.
+        sess = config["session"]
+        self.clear_to_major_delay = float(sess.get("clearToMajorDelaySeconds", DEFAULT_CLEAR_TO_MAJOR_DELAY))
+        self.max_identical_major = int(sess.get("maxIdenticalMajorCommands", DEFAULT_MAX_IDENTICAL_MAJOR))
+        self.input_box_scan_lines = int(sess.get("inputBoxScanLines", DEFAULT_INPUT_BOX_SCAN_LINES))
+        self.menu_max_nav_steps = int(sess.get("menuMaxNavigationSteps", DEFAULT_MENU_MAX_NAV_STEPS))
+        self.menu_key_delay = float(sess.get("menuKeyDelaySeconds", DEFAULT_MENU_KEY_DELAY))
+
+    def _log_level(self) -> int:
+        return {
+            "debug": logging.DEBUG,
+            "info": logging.INFO,
+            "warn": logging.WARNING,
+            "warning": logging.WARNING,
+            "error": logging.ERROR,
+        }.get(self.config["session"].get("logLevel", "info").lower(), logging.INFO)
+
+    def _setup_logger(self) -> logging.Logger:
+        logger = logging.getLogger("gsd-auto-v4")
+        logger.handlers.clear()
+        logger.setLevel(self._log_level())
+        fh = logging.FileHandler(self.paths["log"])
+        fh.setLevel(self._log_level())
+        fh.setFormatter(logging.Formatter(
+            "[%(asctime)s] [%(levelname)s] %(message)s",
+            "%Y-%m-%d %H:%M:%S",
+        ))
+        logger.addHandler(fh)
+        logger.propagate = False
+        return logger
+
+    def _load_state(self) -> RuntimeState:
+        if self.paths["state"].exists():
+            try:
+                return RuntimeState.from_json(json.loads(self.paths["state"].read_text()))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return RuntimeState()
+
+    def _save_state(self) -> None:
+        self.paths["state"].write_text(json.dumps(self.state.to_json(), indent=2))
+
+    def _emit_event(self, **fields) -> None:
+        fields["timestamp"] = dt.datetime.now().isoformat()
+        with self.paths["events"].open("a") as f:
+            f.write(json.dumps(fields) + "\n")
+
+    def _emit_action(self, **fields) -> None:
+        fields["timestamp"] = dt.datetime.now().isoformat()
+        with self.paths["actions"].open("a") as f:
+            f.write(json.dumps(fields) + "\n")
+
+    def _transition(self, new_state: State, *, reason: str = "") -> None:
+        old = self.state.state
+        new = new_state.value
+        if old != new:
+            self.logger.info(f"state: {old} -> {new} ({reason})")
+            self._emit_event(prevState=old, newState=new, reason=reason)
+        self.state.state = new
+        self._save_state()
+
+    def run(self) -> None:
+        try:
+            self._main_loop()
+        except KeyboardInterrupt:
+            self.logger.info("interrupted")
+        except Exception:
+            self.logger.exception("fatal controller error")
+            self.state.state = State.ERROR.value
+            self._save_state()
+        finally:
+            try:
+                self.paths["pid"].unlink()
+            except FileNotFoundError:
+                pass
+
+    def _main_loop(self) -> None:
+        self.logger.info(
+            f"controller start: project={self.repo.name} session={self.session_name} "
+            f"config={self.repo / CONFIG_REL} logLevel={self.config['session'].get('logLevel','info')}"
+        )
+
+        if self.state.state == State.BOOT.value:
+            self._transition(State.SESSION_STARTING, reason="boot")
+        if self.state.state == State.SESSION_STARTING.value:
+            self._transition(State.RUNNING, reason="session brought up")
+
+        poll_interval = float(self.config["session"]["pollIntervalSeconds"])
+        capture_lines = int(self.config["session"]["paneCaptureLines"])
+        idle_stability = int(self.config["session"]["idleStabilityPolls"])
+        log_per_poll = bool(self.config["session"].get("logPerPollClassifier", False))
+
+        while self.state.state not in (State.COMPLETE.value, State.ERROR.value):
+            self.state.pollCount += 1
+
+            try:
+                raw = self.tmux.capture_pane(capture_lines)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                self.logger.error(f"tmux capture failed: {e}")
+                time.sleep(poll_interval)
+                continue
+
+            normalized = normalize_screen(raw)
+            cur_hash = screen_hash(normalized)
+
+            if self.last_hash is None:
+                unstable = False
+                self.stable_count = 1
+            elif cur_hash == self.last_hash:
+                unstable = False
+                self.stable_count += 1
+            else:
+                unstable = True
+                self.stable_count = 1
+
+            try:
+                self.paths["raw"].write_text(raw)
+                self.paths["norm"].write_text(normalized)
+            except OSError as e:
+                self.logger.error(f"failed to persist screen: {e}")
+
+            self.state.screenHash = cur_hash
+            self.state.stableCount = self.stable_count
+            self.last_hash = cur_hash
+
+            classifier, info = classify(
+                normalized, unstable, self.config["patterns"],
+                input_box_scan_lines=self.input_box_scan_lines,
+            )
+
+            self.logger.debug(
+                f"poll #{self.state.pollCount}: lines={normalized.count(chr(10))+1} "
+                f"hash={cur_hash} classifier={classifier.value} stable={self.stable_count}"
+            )
+            if log_per_poll:
+                self.logger.info(
+                    f"poll #{self.state.pollCount}: classifier={classifier.value} "
+                    f"matched={info.get('matched')}"
+                )
+
+            paused = self.paths["pause_flag"].exists()
+            if not paused:
+                try:
+                    self._step(classifier, info, normalized, idle_stability)
+                except Exception:
+                    self.logger.exception("error in step handler")
+
+            self._save_state()
+            time.sleep(poll_interval)
+
+    def _step(self, classifier: Classifier, info: dict,
+              normalized: str, idle_stability: int) -> None:
+        if classifier == Classifier.BUSY and not self.state.hasObservedFirstCycle:
+            self.state.hasObservedFirstCycle = True
+            self.logger.info("observed first busy cycle; entering steady-state mode")
+
+        cur = State(self.state.state)
+
+        if cur == State.PAUSED_FOR_HUMAN:
+            if classifier == Classifier.BUSY:
+                self._transition(State.RUNNING, reason="human activity detected; resuming")
+            return
+
+        if cur == State.WAITING_FOR_RESET:
+            self._handle_waiting_for_reset(classifier, normalized)
+            return
+
+        # All other live states route through the same dispatcher; it re-classifies
+        # and either acts or transitions to a terminal/paused state.
+        self._dispatch(classifier, info, normalized, idle_stability)
+
+    def _dispatch(self, classifier: Classifier, info: dict,
+                  normalized: str, idle_stability: int) -> None:
+        if classifier == Classifier.BUSY:
+            if self.state.state != State.RUNNING.value:
+                self._transition(State.RUNNING, reason="busy observed")
+            return
+
+        if classifier == Classifier.USAGE_LIMITED:
+            self._transition(State.USAGE_LIMITED, reason=f"usage limit detected ({info.get('matched')})")
+            self._handle_usage_limited(normalized)
+            return
+
+        if classifier == Classifier.MENU:
+            self._transition(State.INTERACTIVE_MENU, reason=f"menu detected (footer={info.get('matched')}, hasInputBox={info.get('hasInputBox')})")
+            self._handle_menu(normalized)
+            return
+
+        if classifier == Classifier.TEXT_PROMPT:
+            self._transition(State.TEXT_PROMPT, reason=f"text prompt detected ({info.get('matched')})")
+            self._handle_text_prompt(normalized)
+            return
+
+        # IDLE
+        if not self.state.hasObservedFirstCycle:
+            self.logger.debug("idle pre-bootstrap; waiting for human first command")
+            return
+
+        if self.stable_count < idle_stability:
+            self.logger.debug(f"idle stable {self.stable_count}/{idle_stability}; waiting")
+            return
+
+        self.logger.info(
+            f"poll #{self.state.pollCount}: classifier=idle "
+            f"(hash stable {self.stable_count}/{idle_stability}) → DECISION_REQUIRED"
+        )
+        self._transition(State.DECISION_REQUIRED, reason=f"idle stable {self.stable_count}")
+        self._handle_decision(normalized)
+
+    def _handle_decision(self, normalized: str) -> None:
+        if self.paths["stop_next_flag"].exists():
+            self.logger.warning("stop-next.flag present; transitioning to COMPLETE")
+            self._transition(State.COMPLETE, reason="stop-next requested by user")
+            return
+
+        decision = steady_state_decision(normalized, self.config)
+        if decision is None:
+            if self.config["policy"].get("allowLlmFallback"):
+                self._try_llm_fallback(normalized)
+                return
+            self.logger.warning("no deterministic rule matched at idle; pausing for human")
+            self._transition(State.PAUSED_FOR_HUMAN, reason="ambiguous_idle")
+            return
+
+        self.logger.info(
+            f"decision: {decision['rule']} matched, phase={decision.get('phase')}, "
+            f"action={decision.get('next')}"
+        )
+        self._emit_event(decision=decision)
+
+        if decision["next"] == "complete":
+            self.logger.info("milestone boundary detected; no next phase. COMPLETE")
+            self._transition(State.COMPLETE, reason="execution complete and no next phase")
+            return
+
+        phase = decision.get("phase")
+        if not phase:
+            self.logger.warning("decision missing phase; pausing")
+            self._transition(State.PAUSED_FOR_HUMAN, reason="phase extraction failed")
+            return
+
+        self.state.lastPhase = phase
+
+        if decision["next"] == "execute":
+            tmpl = self.config["commands"]["execute"]["default"]
+            self._send_major_command(tmpl, phase=phase)
+        elif decision["next"] == "plan":
+            mode = self.config["policy"].get("defaultPlanMode", "without_research")
+            tmpl_key = "withResearch" if mode == "with_research" else "withoutResearch"
+            tmpl = self.config["commands"]["plan"][tmpl_key]
+            prd = self.config["project"].get("prdPath", "")
+            self._send_major_command(tmpl, phase=phase, prd=prd)
+        else:
+            self.logger.warning(f"unknown decision.next={decision['next']}; pausing")
+            self._transition(State.PAUSED_FOR_HUMAN, reason="unknown decision branch")
+            return
+
+        self._transition(State.RUNNING, reason="action sent")
+
+    def _send_major_command(self, template: str, *, phase: str, prd: str = "") -> None:
+        if self.paths["stop_next_flag"].exists():
+            self.logger.warning("stop-next requested; refusing to send major command")
+            self._transition(State.COMPLETE, reason="stop-next")
+            return
+
+        cmd = render_command(template, phase=phase, prd=prd, project=self.repo.name)
+
+        if cmd == self.state.lastCommandSent:
+            self.state.retryCounts["sameMajor"] = self.state.retryCounts.get("sameMajor", 0) + 1
+            count = self.state.retryCounts["sameMajor"]
+            self.logger.warning(
+                f"about to send identical major command (count={count}/{self.max_identical_major}): {cmd}"
+            )
+            if count >= self.max_identical_major:
+                self.logger.error("identical major command threshold exceeded; pausing")
+                self._transition(State.PAUSED_FOR_HUMAN, reason="repeated identical major command")
+                return
+        else:
+            self.state.retryCounts["sameMajor"] = 0
+
+        if self.config["policy"].get("clearBeforeMajorCommand", True):
+            clear_cmd = self.config["commands"].get("clear", "/clear")
+            self._send_text(clear_cmd)
+            time.sleep(self.clear_to_major_delay)
+
+        self._send_text(cmd)
+        self.state.lastCommandSent = cmd
+        self.stable_count = 0
+        self.state.stableCount = 0
+
+    def _send_text(self, text: str) -> None:
+        self.logger.info(f"action: tmux send-keys '{text}' Enter")
+        try:
+            self.tmux.send_text_enter(text)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            self.state.retryCounts["sendFailures"] = self.state.retryCounts.get("sendFailures", 0) + 1
+            self.logger.error(
+                f"send-keys failed (count={self.state.retryCounts['sendFailures']}): {e}"
+            )
+            self._transition(State.PAUSED_FOR_HUMAN, reason=f"send-keys failed: {e}")
+            return
+        self.state.retryCounts["sendFailures"] = 0
+        self.state.lastActionTimestamp = dt.datetime.now().isoformat()
+        self._emit_action(kind="text", text=text)
+
+    def _handle_menu(self, normalized: str) -> None:
+        wait_opts = self.config["patterns"].get("waitForResetOption", [])
+        for opt in wait_opts:
+            if re.search(opt, normalized, re.IGNORECASE):
+                self.logger.info(f"menu: recognized usage-reset option '{opt}'")
+                self._navigate_to_option(normalized, opt)
+                return
+        self.logger.warning("menu: no recognized rule; pausing")
+        self._transition(State.PAUSED_FOR_HUMAN, reason="unrecognized menu")
+
+    def _navigate_to_option(self, normalized: str, target_pattern: str) -> None:
+        lines = normalized.split("\n")
+        cursor_idx = None
+        target_idx = None
+        for i, ln in enumerate(lines):
+            # Use the ❯ glyph as the only cursor signal. The bare ">" was previously
+            # accepted as a fallback, but it false-positives on the input box's own
+            # ">" prompt and on quoted/blockquote lines.
+            if cursor_idx is None and "❯" in ln:
+                cursor_idx = i
+            if target_idx is None and re.search(target_pattern, ln, re.IGNORECASE):
+                target_idx = i
+
+        if cursor_idx is None or target_idx is None:
+            self.logger.warning(
+                f"menu navigation: cursor={cursor_idx} target={target_idx}; pausing"
+            )
+            self._transition(State.PAUSED_FOR_HUMAN, reason="menu navigation failed")
+            return
+
+        diff = target_idx - cursor_idx
+        if abs(diff) > self.menu_max_nav_steps:
+            self.logger.warning(
+                f"menu navigation: distance {diff} exceeds {self.menu_max_nav_steps}; pausing"
+            )
+            self._transition(State.PAUSED_FOR_HUMAN, reason="menu distance too large")
+            return
+
+        key = "Down" if diff > 0 else "Up"
+        steps = abs(diff)
+        if steps > 0:
+            self.logger.info(f"menu: navigating cursor {cursor_idx} -> target {target_idx} ({key} x{steps})")
+            for _ in range(steps):
+                try:
+                    self.tmux.send_keys(key)
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                    self.logger.error(f"menu nav send-keys '{key}' failed: {e}")
+                    self._transition(State.PAUSED_FOR_HUMAN, reason=f"menu nav send-keys failed: {e}")
+                    return
+                self._emit_action(kind="key", text=key)
+                time.sleep(self.menu_key_delay)
+
+        self.logger.info("menu: confirming with Enter")
+        try:
+            self.tmux.send_keys("Enter")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            self.logger.error(f"menu confirm send-keys 'Enter' failed: {e}")
+            self._transition(State.PAUSED_FOR_HUMAN, reason=f"menu confirm send-keys failed: {e}")
+            return
+        self._emit_action(kind="key", text="Enter")
+
+        wait_min = self.config["policy"].get("usageResetWaitMinutes", 15)
+        self.state.usageResetAttempts += 1
+        self.state.waitingResetUntil = (
+            dt.datetime.now() + dt.timedelta(minutes=wait_min)
+        ).isoformat()
+        self._transition(State.WAITING_FOR_RESET, reason=f"selected reset option: {target_pattern}")
+
+    def _handle_text_prompt(self, normalized: str) -> None:
+        if self.config["policy"].get("deferVerificationToMilestoneEnd"):
+            for p in self.config["patterns"].get("verificationRequest", []):
+                if re.search(p, normalized, re.IGNORECASE):
+                    text = self.config["policy"].get(
+                        "verificationDeferralText",
+                        "defer to end of milestone verification",
+                    )
+                    self._send_text(text)
+                    self._transition(State.RUNNING, reason="verification deferred")
+                    return
+
+        if self.config["policy"].get("allowLlmFallback"):
+            self._try_llm_fallback(normalized)
+            return
+
+        self.logger.warning("text prompt: no rule matched; pausing")
+        self._transition(State.PAUSED_FOR_HUMAN, reason="unrecognized text prompt")
+
+    def _handle_usage_limited(self, normalized: str) -> None:
+        max_attempts = int(self.config["policy"].get("maxUsageResetAttempts", 32))
+        if self.state.usageResetAttempts >= max_attempts:
+            self.logger.error(f"max usage reset attempts ({max_attempts}) exhausted; pausing")
+            self._transition(State.PAUSED_FOR_HUMAN, reason="usage reset attempts exhausted")
+            return
+
+        for opt in self.config["patterns"].get("waitForResetOption", []):
+            if re.search(opt, normalized, re.IGNORECASE):
+                self._transition(State.INTERACTIVE_MENU, reason="usage-reset menu visible")
+                self._handle_menu(normalized)
+                return
+
+        wait_min = self.config["policy"].get("usageResetWaitMinutes", 15)
+        self.state.usageResetAttempts += 1
+        self.state.waitingResetUntil = (
+            dt.datetime.now() + dt.timedelta(minutes=wait_min)
+        ).isoformat()
+        self.logger.info(
+            f"usage limited; passive wait until {self.state.waitingResetUntil} "
+            f"(attempt {self.state.usageResetAttempts}/{max_attempts})"
+        )
+        self._transition(State.WAITING_FOR_RESET, reason="passive wait")
+
+    def _handle_waiting_for_reset(self, classifier: Classifier, normalized: str) -> None:
+        if self.state.waitingResetUntil:
+            try:
+                until = dt.datetime.fromisoformat(self.state.waitingResetUntil)
+            except ValueError:
+                until = dt.datetime.now()
+            if dt.datetime.now() < until:
+                self.logger.debug(f"WAITING_FOR_RESET: until {until.isoformat()}")
+                return
+
+        max_attempts = int(self.config["policy"].get("maxUsageResetAttempts", 32))
+        if classifier == Classifier.USAGE_LIMITED:
+            if self.state.usageResetAttempts >= max_attempts:
+                self.logger.error("max usage reset attempts exhausted")
+                self._transition(State.PAUSED_FOR_HUMAN, reason="usage reset attempts exhausted")
+                return
+            cont = self.config["commands"].get("continue", "continue")
+            self.logger.info(
+                f"WAITING_FOR_RESET timeout; usage still limited; sending '{cont}' "
+                f"(attempt {self.state.usageResetAttempts + 1}/{max_attempts})"
+            )
+            self._send_text(cont)
+            self.state.usageResetAttempts += 1
+            wait_min = self.config["policy"].get("usageResetWaitMinutes", 15)
+            self.state.waitingResetUntil = (
+                dt.datetime.now() + dt.timedelta(minutes=wait_min)
+            ).isoformat()
+            return
+
+        self.logger.info("usage block cleared; resuming")
+        self.state.waitingResetUntil = None
+        self._transition(State.RUNNING, reason="usage block cleared")
+
+    def _try_llm_fallback(self, normalized: str) -> None:
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            self.logger.warning("LLM fallback enabled but ANTHROPIC_API_KEY not set; pausing")
+            self._transition(State.PAUSED_FOR_HUMAN, reason="LLM fallback unavailable")
+            return
+
+        whitelist = self.config["policy"].get("llmFallbackAllowedTexts", [])
+        snapshot_id = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+        snapshot_path = self.paths["screens"] / f"{snapshot_id}.txt"
+        try:
+            snapshot_path.write_text(normalized)
+        except OSError:
+            pass
+
+        prompt = (
+            "You are a CLI orchestration assistant inspecting one terminal screen.\n"
+            "Decide ONE next action.\n\n"
+            "Output ONLY a JSON object of the form:\n"
+            '{"decision": "send_text" | "pause_for_human", '
+            '"text": "<must exactly match one of the allowed strings>", '
+            '"reason": "<<=200 chars>", "confidence": "high" | "low"}\n\n'
+            f"Allowed text values (case-insensitive exact match): {json.dumps(whitelist)}\n"
+            "You MAY NOT issue slash commands. You MAY NOT navigate menus. "
+            "If the safe action is not unambiguous, return decision=pause_for_human.\n\n"
+            f"Controller state: {self.state.state}\n"
+            f"Last command sent: {self.state.lastCommandSent!r}\n"
+            f"Last phase: {self.state.lastPhase!r}\n\n"
+            f"Screen (last 4000 chars):\n{normalized[-4000:]}\n"
+        )
+
+        body = {
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp_data = json.loads(resp.read())
+            text = "".join(p.get("text", "") for p in resp_data.get("content", []))
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as e:
+            self.logger.error(f"LLM fallback request failed: {e}; pausing")
+            self._transition(State.PAUSED_FOR_HUMAN, reason="LLM fallback error")
+            return
+
+        self.logger.info(f"LLM fallback raw response: {text!r}")
+
+        decision_obj = None
+        try:
+            m = re.search(r"\{.*\}", text, re.DOTALL)
+            decision_obj = json.loads(m.group(0)) if m else json.loads(text)
+        except (json.JSONDecodeError, AttributeError):
+            self.logger.warning("LLM fallback returned non-JSON; pausing")
+            self._transition(State.PAUSED_FOR_HUMAN, reason="LLM non-JSON response")
+            return
+
+        valid = (
+            isinstance(decision_obj, dict)
+            and decision_obj.get("decision") in ("send_text", "pause_for_human")
+            and isinstance(decision_obj.get("text", ""), str)
+            and isinstance(decision_obj.get("reason", ""), str)
+        )
+        if not valid:
+            self.logger.warning(f"LLM fallback failed schema validation: {decision_obj}")
+            self._transition(State.PAUSED_FOR_HUMAN, reason="LLM schema invalid")
+            return
+
+        self._emit_event(
+            llmFallback={
+                "snapshot": str(snapshot_path),
+                "raw": text[:500],
+                "parsed": decision_obj,
+            }
+        )
+
+        if decision_obj["decision"] == "pause_for_human":
+            self.logger.info(f"LLM advised pause: {decision_obj.get('reason')}")
+            self._transition(State.PAUSED_FOR_HUMAN, reason="LLM pause_for_human")
+            return
+
+        proposed = decision_obj.get("text", "")
+        canonical = next((w for w in whitelist if proposed.lower() == w.lower()), None)
+        if canonical is None:
+            self.logger.warning(f"LLM proposed non-whitelisted text {proposed!r}; pausing")
+            self._transition(State.PAUSED_FOR_HUMAN, reason="LLM text not in whitelist")
+            return
+
+        if canonical != proposed:
+            self.logger.info(
+                f"LLM fallback canonicalized '{proposed}' -> '{canonical}'"
+            )
+        self.logger.info(f"LLM fallback approved: '{canonical}' (confidence={decision_obj.get('confidence')})")
+        self._send_text(canonical)
+        self._transition(State.RUNNING, reason="LLM fallback action sent")
+
+
+# ---------- Config ----------
+
+def load_config(repo: pathlib.Path) -> dict:
+    cfg_path = repo / CONFIG_REL
+    if not cfg_path.exists():
+        raise SystemExit(
+            f"[gsd-auto-v4] config not found: {cfg_path}\n"
+            "Run `gsd-auto-v4 init` from the target repo first."
+        )
+    try:
+        return json.loads(cfg_path.read_text())
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"[gsd-auto-v4] config is not valid JSON: {cfg_path}: {e}")
+
+
+def validate_config(cfg: dict) -> list[str]:
+    errors: list[str] = []
+    for top in ("session", "commands", "patterns", "policy"):
+        if top not in cfg:
+            errors.append(f"missing top-level key: {top}")
+
+    sess = cfg.get("session", {})
+    for k in ("tmuxSessionName", "claudeLaunchCommand", "paneCaptureLines",
+              "pollIntervalSeconds", "idleStabilityPolls"):
+        if k not in sess:
+            errors.append(f"session.{k} missing")
+
+    cmds = cfg.get("commands", {})
+    if "execute" not in cmds or "default" not in cmds.get("execute", {}):
+        errors.append("commands.execute.default missing")
+    if "plan" not in cmds or "withoutResearch" not in cmds.get("plan", {}):
+        errors.append("commands.plan.withoutResearch missing")
+
+    pol = cfg.get("policy", {})
+    if pol.get("defaultPlanMode") not in ("with_research", "without_research", None):
+        errors.append("policy.defaultPlanMode must be with_research or without_research")
+
+    return errors
+
+
+def is_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def session_name_for(repo: pathlib.Path, cfg: dict) -> str:
+    return cfg["session"]["tmuxSessionName"].replace("{project}", repo.name)
+
+
+# ---------- CLI commands ----------
+
+def cmd_init(_args) -> None:
+    repo = pathlib.Path.cwd()
+    cfg_dir = repo / "gsd-auto"
+    cfg_dir.mkdir(exist_ok=True)
+    (cfg_dir / "runtime").mkdir(exist_ok=True)
+    (cfg_dir / "runtime" / "screens").mkdir(exist_ok=True)
+
+    target = cfg_dir / "config.json"
+    if target.exists():
+        print(f"[gsd-auto-v4] config already exists: {target}")
+    else:
+        if not TEMPLATE_CONFIG.exists():
+            print(f"[gsd-auto-v4] template not found: {TEMPLATE_CONFIG}", file=sys.stderr)
+            sys.exit(1)
+        shutil.copy(TEMPLATE_CONFIG, target)
+        print(f"[gsd-auto-v4] wrote {target}")
+
+    gitignore = repo / ".gitignore"
+    line = "gsd-auto/runtime/"
+    if gitignore.exists():
+        existing = gitignore.read_text()
+        if line not in existing.splitlines():
+            with gitignore.open("a") as f:
+                if existing and not existing.endswith("\n"):
+                    f.write("\n")
+                f.write(line + "\n")
+            print(f"[gsd-auto-v4] added {line} to .gitignore")
+    else:
+        gitignore.write_text(line + "\n")
+        print(f"[gsd-auto-v4] created .gitignore with {line}")
+
+    print(f"[gsd-auto-v4] init complete: {cfg_dir}")
+    print("Next: edit gsd-auto/config.json if needed, then `gsd-auto-v4 run`.")
+
+
+def cmd_run(_args) -> None:
+    repo = pathlib.Path.cwd()
+    cfg = load_config(repo)
+    errs = validate_config(cfg)
+    if errs:
+        for e in errs:
+            print(f"[gsd-auto-v4] config error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    paths = runtime_paths(repo)
+    paths["root"].mkdir(parents=True, exist_ok=True)
+    paths["screens"].mkdir(parents=True, exist_ok=True)
+
+    if shutil.which("tmux") is None:
+        print("[gsd-auto-v4] tmux not found in PATH", file=sys.stderr)
+        sys.exit(1)
+
+    session = session_name_for(repo, cfg)
+
+    if paths["pid"].exists():
+        try:
+            pid_text = paths["pid"].read_text().strip()
+            existing = int(pid_text) if pid_text else 0
+        except (ValueError, OSError):
+            existing = 0
+        if existing and is_pid_alive(existing):
+            print(f"[gsd-auto-v4] controller already running (PID {existing})")
+            print(f"[gsd-auto-v4] attaching to tmux session {session}")
+            os.execvp("tmux", ["tmux", "attach", "-t", session])
+        else:
+            try:
+                paths["pid"].unlink()
+            except FileNotFoundError:
+                pass
+
+    tmux = Tmux(session)
+    try:
+        if not tmux.has_session():
+            print(f"[gsd-auto-v4] creating tmux session: {session}")
+            tmux.new_session()
+            time.sleep(0.5)
+            launch = cfg["session"]["claudeLaunchCommand"]
+            print(f"[gsd-auto-v4] launching Claude: {launch}")
+            tmux.send_text_enter(launch)
+            time.sleep(2)
+        else:
+            print(f"[gsd-auto-v4] tmux session exists: {session}")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        print(f"[gsd-auto-v4] tmux startup failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print("[gsd-auto-v4] starting controller loop in background")
+    # Capture stderr to a file so config/import errors that fire before the
+    # logger is set up are still diagnosable.
+    stderr_log_path = paths["root"] / "loop-stderr.log"
+    stderr_log = open(stderr_log_path, "a")
+    child = subprocess.Popen(
+        [sys.executable, str(SCRIPT_PATH), "_loop"],
+        cwd=str(repo),
+        stdout=subprocess.DEVNULL,
+        stderr=stderr_log,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    stderr_log.close()
+    paths["pid"].write_text(str(child.pid))
+    print(f"[gsd-auto-v4] controller PID {child.pid}")
+    print(f"[gsd-auto-v4] log: {paths['log']}")
+    print(f"[gsd-auto-v4] stderr: {stderr_log_path}")
+    print(f"[gsd-auto-v4] attaching to tmux (Ctrl-b d to detach; controller keeps running)")
+    time.sleep(0.5)
+    os.execvp("tmux", ["tmux", "attach", "-t", session])
+
+
+def cmd_loop(_args) -> None:
+    repo = pathlib.Path.cwd()
+    cfg = load_config(repo)
+    paths = runtime_paths(repo)
+    paths["root"].mkdir(parents=True, exist_ok=True)
+    paths["screens"].mkdir(parents=True, exist_ok=True)
+    Controller(repo, cfg).run()
+
+
+def cmd_attach(_args) -> None:
+    repo = pathlib.Path.cwd()
+    cfg = load_config(repo)
+    session = session_name_for(repo, cfg)
+    os.execvp("tmux", ["tmux", "attach", "-t", session])
+
+
+def cmd_status(_args) -> None:
+    repo = pathlib.Path.cwd()
+    paths = runtime_paths(repo)
+    if not paths["state"].exists():
+        print("[gsd-auto-v4] no state file; controller has not run in this repo")
+        return
+    try:
+        state = json.loads(paths["state"].read_text())
+    except (json.JSONDecodeError, OSError):
+        print("[gsd-auto-v4] state file unreadable")
+        return
+
+    pid = None
+    alive = False
+    if paths["pid"].exists():
+        try:
+            pid = int(paths["pid"].read_text().strip())
+            alive = is_pid_alive(pid)
+        except (ValueError, OSError):
+            pass
+
+    last_change_age = "?"
+    ts = state.get("lastActionTimestamp")
+    if ts:
+        try:
+            then = dt.datetime.fromisoformat(ts)
+            last_change_age = f"{int((dt.datetime.now() - then).total_seconds())}s ago"
+        except ValueError:
+            pass
+
+    print(f"controller PID:    {pid} ({'alive' if alive else 'dead'})")
+    print(f"state:             {state.get('state')}")
+    print(f"observed first:    {state.get('hasObservedFirstCycle')}")
+    print(f"last phase:        {state.get('lastPhase')}")
+    print(f"last command:      {state.get('lastCommandSent')}")
+    print(f"last action:       {last_change_age}")
+    print(f"poll count:        {state.get('pollCount')}")
+    print(f"screen hash:       {state.get('screenHash')}")
+    print(f"stable count:      {state.get('stableCount')}")
+    print(f"reset attempts:    {state.get('usageResetAttempts')}")
+    print(f"waiting until:     {state.get('waitingResetUntil')}")
+    print(f"retry counts:      {state.get('retryCounts')}")
+    flags = []
+    if paths["pause_flag"].exists():
+        flags.append("PAUSED")
+    if paths["stop_next_flag"].exists():
+        flags.append("STOP-NEXT")
+    print(f"flags:             {', '.join(flags) if flags else '(none)'}")
+
+
+def cmd_pause(_args) -> None:
+    paths = runtime_paths(pathlib.Path.cwd())
+    paths["root"].mkdir(parents=True, exist_ok=True)
+    paths["pause_flag"].touch()
+    print(f"[gsd-auto-v4] paused (flag: {paths['pause_flag']})")
+    print("Run `gsd-auto-v4 resume` to re-enable action injection.")
+
+
+def cmd_resume(_args) -> None:
+    paths = runtime_paths(pathlib.Path.cwd())
+    try:
+        paths["pause_flag"].unlink()
+    except FileNotFoundError:
+        pass
+    print("[gsd-auto-v4] resumed")
+
+
+def cmd_stop_next(_args) -> None:
+    paths = runtime_paths(pathlib.Path.cwd())
+    paths["root"].mkdir(parents=True, exist_ok=True)
+    paths["stop_next_flag"].touch()
+    print(f"[gsd-auto-v4] stop-next set (flag: {paths['stop_next_flag']})")
+    print("The controller will transition to COMPLETE before injecting another major command.")
+
+
+def cmd_tail(args) -> None:
+    paths = runtime_paths(pathlib.Path.cwd())
+    log = paths["log"]
+    if not log.exists():
+        print(f"[gsd-auto-v4] log not found: {log}")
+        return
+    if args.follow:
+        os.execvp("tail", ["tail", "-F", str(log)])
+    else:
+        os.execvp("tail", ["tail", "-n", str(args.lines), str(log)])
+
+
+def cmd_doctor(_args) -> None:
+    repo = pathlib.Path.cwd()
+    issues: list[str] = []
+
+    if shutil.which("tmux") is None:
+        issues.append("tmux not found in PATH")
+    else:
+        print("[ok] tmux available")
+
+    cfg_path = repo / CONFIG_REL
+    cfg = None
+    if not cfg_path.exists():
+        issues.append(f"config missing: {cfg_path} (run `gsd-auto-v4 init`)")
+    else:
+        try:
+            cfg = json.loads(cfg_path.read_text())
+        except json.JSONDecodeError as e:
+            issues.append(f"config not valid JSON: {e}")
+        else:
+            errs = validate_config(cfg)
+            if errs:
+                for e in errs:
+                    issues.append(f"config: {e}")
+            else:
+                print(f"[ok] config valid: {cfg_path}")
+                project = repo.name
+                prd = cfg["project"].get("prdPath", "") if "project" in cfg else ""
+                phase = "00.0"
+                templates = []
+                if "plan" in cfg["commands"]:
+                    if "withResearch" in cfg["commands"]["plan"]:
+                        templates.append(("plan.withResearch", cfg["commands"]["plan"]["withResearch"]))
+                    if "withoutResearch" in cfg["commands"]["plan"]:
+                        templates.append(("plan.withoutResearch", cfg["commands"]["plan"]["withoutResearch"]))
+                if "execute" in cfg["commands"]:
+                    if "default" in cfg["commands"]["execute"]:
+                        templates.append(("execute.default", cfg["commands"]["execute"]["default"]))
+                for label, tmpl in templates:
+                    rendered = render_command(tmpl, phase=phase, prd=prd, project=project)
+                    print(f"[ok] template {label}: {rendered}")
+                if shutil.which("tmux"):
+                    session = session_name_for(repo, cfg)
+                    if Tmux(session).has_session():
+                        print(f"[ok] tmux session exists: {session}")
+                    else:
+                        print(f"[info] tmux session does not exist yet: {session}")
+
+    paths = runtime_paths(repo)
+    try:
+        paths["root"].mkdir(parents=True, exist_ok=True)
+        test = paths["root"] / ".doctor"
+        test.write_text("ok")
+        test.unlink()
+        print(f"[ok] runtime dir writable: {paths['root']}")
+    except OSError as e:
+        issues.append(f"runtime dir not writable: {e}")
+
+    if not TEMPLATE_CONFIG.exists():
+        issues.append(f"init template missing: {TEMPLATE_CONFIG}")
+    else:
+        print(f"[ok] init template present: {TEMPLATE_CONFIG}")
+
+    if issues:
+        print("\nIssues:")
+        for i in issues:
+            print(f"  - {i}")
+        sys.exit(1)
+    print("\n[ok] all checks passed")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        prog="gsd-auto-v4",
+        description="Terminal-native automation controller for GSD workflows.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("init", help="Initialize gsd-auto config in current repo")
+    sub.add_parser("run", help="Start or resume controller and attach to tmux session")
+    sub.add_parser("attach", help="Attach to the tmux session")
+    sub.add_parser("status", help="Show controller status")
+    sub.add_parser("pause", help="Pause action injection")
+    sub.add_parser("resume", help="Resume action injection")
+    sub.add_parser("stop-next", help="Allow current task to finish, then COMPLETE")
+
+    pt = sub.add_parser("tail", help="Tail controller log")
+    pt.add_argument("-f", "--follow", action="store_true", help="Follow new log lines")
+    pt.add_argument("-n", "--lines", type=int, default=200, help="Number of trailing lines")
+
+    sub.add_parser("doctor", help="Validate environment and config")
+    sub.add_parser("_loop", help=argparse.SUPPRESS)
+
+    args = p.parse_args()
+    dispatch = {
+        "init": cmd_init,
+        "run": cmd_run,
+        "attach": cmd_attach,
+        "status": cmd_status,
+        "pause": cmd_pause,
+        "resume": cmd_resume,
+        "stop-next": cmd_stop_next,
+        "tail": cmd_tail,
+        "doctor": cmd_doctor,
+        "_loop": cmd_loop,
+    }
+    dispatch[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
