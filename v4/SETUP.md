@@ -38,6 +38,37 @@ Verify:
 gsd-auto-v4 --help
 ```
 
+## Remove legacy v2/v3 artifacts before first run
+
+If this machine ever ran gsd-auto v2 or v3, the old Stop hook can still be wired into Claude Code and will inject `tmux send-keys` commands behind v4's back. Symptoms: phases auto-advance with old flag formats (`--research --prd .planning/ROADMAP.md`) that don't match your v4 config, OpenAI tokens get burned on every Claude stop, and your `actions.jsonl` shows nothing while the tmux pane keeps progressing. Both controllers fight over the session.
+
+**Check for the legacy hook:**
+
+```bash
+grep -nE "gsd-auto-stop|v2/gsd-auto.sh|v3/v3.sh" ~/.claude/settings.json ~/.claude/settings.local.json 2>/dev/null
+ls ~/.claude/hooks/gsd-auto-stop.sh 2>/dev/null
+```
+
+If anything matches, **remove it before running v4**:
+
+1. Open `~/.claude/settings.json` and delete the entire `"Stop"` block whose command points at `gsd-auto-stop.sh` (and any `Stop` block referencing `v2/gsd-auto.sh` or `v3/v3.sh`). Keep the rest of the hooks file intact.
+2. Move the bridge script out of the hooks dir so it can't be picked up by anything else:
+
+   ```bash
+   mv ~/.claude/hooks/gsd-auto-stop.sh ~/projects/gsd-auto/v3/gsd-auto-stop.sh   # or wherever your old version lived
+   ```
+
+   The actual reference scripts under `~/projects/gsd-auto/v2/` and `~/projects/gsd-auto/v3/` can stay — they're harmless once nothing in `~/.claude/` registers or invokes them.
+
+3. Sanity check:
+
+   ```bash
+   python3 -c "import json; print(list(json.load(open('/home/'+'$USER'+'/.claude/settings.json'))['hooks'].keys()))"
+   # Should NOT include 'Stop' (unless you have your own non-legacy Stop hook)
+   ```
+
+If you skip this step on a previously-v3 machine, v4's `actions.jsonl` will appear correct but you'll be silently running TWO competing controllers and your config edits will look like they have no effect.
+
 ## Per-project setup
 
 `cd` into any GSD project, then:
@@ -85,11 +116,13 @@ gsd-auto-v4 pause       # immediately stop injecting actions (controller keeps o
 gsd-auto-v4 resume      # un-pause
 ```
 
-To force-kill a stuck controller:
+To hard-kill everything (controller process + tmux session, no graceful shutdown):
 
 ```bash
-kill "$(cat gsd-auto/runtime/controller.pid)"
+gsd-auto-v4 kill
 ```
+
+This sends SIGTERM to the controller (escalating to SIGKILL after 2s if still alive), removes the stale PID file, and runs `tmux kill-session` on the project's session. Use it when the controller and tmux session have gotten out of sync, or when `stop-next` is too slow.
 
 ## Optional: LLM fallback
 

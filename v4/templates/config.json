@@ -2,7 +2,8 @@
   "version": 1,
   "session": {
     "tmuxSessionName": "gsd-auto-{project}",
-    "claudeLaunchCommand": "claude --dangerously-skip-permissions --model default",
+    "claudeLaunchCommand": "claude --dangerously-skip-permissions --model {model}",
+    "model": "claude-opus-4-6[1m]",
     "paneCaptureLines": 250,
     "pollIntervalSeconds": 5,
     "idleStabilityPolls": 3,
@@ -12,13 +13,14 @@
     "maxIdenticalMajorCommands": 2,
     "inputBoxScanLines": 5,
     "menuMaxNavigationSteps": 40,
-    "menuKeyDelaySeconds": 0.1
+    "menuKeyDelaySeconds": 0.1,
+    "heartbeatIntervalSeconds": 300
   },
   "commands": {
     "clear": "/clear",
     "plan": {
-      "withResearch": "/gsd-plan-phase {phase} --research --prd {prd}",
-      "withoutResearch": "/gsd-plan-phase {phase} --prd {prd}"
+      "withResearch": "/gsd-plan-phase {phase} --research --skip-ui --skip-bounce --text {verifyFlag} --prd {prd}",
+      "withoutResearch": "/gsd-plan-phase {phase} --skip-research --skip-ui --skip-bounce --text {verifyFlag} --prd {prd}"
     },
     "execute": {
       "default": "/gsd-execute-phase {phase}"
@@ -30,10 +32,11 @@
   },
   "policy": {
     "defaultPlanMode": "without_research",
+    "skipPlanVerification": true,
     "clearBeforeMajorCommand": true,
     "deferVerificationToMilestoneEnd": true,
     "verificationDeferralText": "defer to end of milestone verification",
-    "allowLlmFallback": false,
+    "allowLlmFallback": true,
     "llmFallbackAllowedTexts": [
       "continue",
       "y",
@@ -50,11 +53,13 @@
   "patterns": {
     "busyMarkers": [
       "esc to interrupt",
-      "Crafting",
-      "Working",
-      "Bashing",
-      "Reading",
-      "Thinking"
+      "ctrl\\+b ctrl\\+b \\(twice\\) to run in background",
+      "\\(\\d+m \\d+s · ",
+      "thought for \\d+s",
+      "\\d+ local agents? still running",
+      "· \\d+ local agents?",
+      "Backgrounded agent",
+      "Waiting for completion notifications"
     ],
     "menuNavFooter": [
       "Enter to select",
@@ -62,14 +67,12 @@
       "Esc to cancel"
     ],
     "inputBoxBorderChars": ["╭", "╰", "│"],
-    "usageLimit": [
-      "usage limit",
-      "no usage remains",
-      "wait for usage to reset"
+    "usageLimitMenuOptions": [
+      "Stop and wait for limit to reset",
+      "Upgrade your plan"
     ],
     "waitForResetOption": [
-      "wait for usage to reset",
-      "Wait for reset"
+      "Stop and wait for limit to reset"
     ],
     "verificationRequest": [
       "verification required",

@@ -14,6 +14,7 @@ import os
 import pathlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -86,20 +87,31 @@ def screen_hash(normalized: str) -> str:
 
 
 def has_input_box(normalized: str, scan_lines: int = DEFAULT_INPUT_BOX_SCAN_LINES) -> bool:
-    """Detect Claude's input-box by its corner glyphs on a single bottom row.
+    """Detect Claude's input-box in either idle or busy rendering.
 
-    Looks for a row in the last `scan_lines` lines that contains both ╰ and ╯
-    (the bottom border) — and as a fallback both ╭ and ╮ (the top border).
-    The bare vertical bar │ is not used: it appears constantly in tool-call
-    boxes, tables, and other agent output and produces false positives.
+    Idle state renders the input as a rounded box (╭─╮ / ╰─╯) with the prompt ❯
+    inside. Busy state collapses the box into two long horizontal rules (─×N)
+    sandwiching a ❯ line — same input area, different chrome.
+
+    Detection (within the last `scan_lines` rows):
+      1. corner-glyph pair: ╰ and ╯ on one line, or ╭ and ╮ on one line — idle.
+      2. busy fallback: a ❯-prefixed prompt line plus at least one
+         long horizontal-rule line (≥50 ─ characters) within the window.
+
+    The bare vertical bar │ is intentionally not used: it appears constantly in
+    tool-call boxes, tables, and agent output and produces false positives.
+    The 50-char rule threshold avoids matching table separators (typically
+    interrupted by ┼/┬/┴) and short divider glyphs in lists or summaries.
     """
     if scan_lines <= 0:
         return False
-    lines = normalized.split("\n")
-    for ln in lines[-scan_lines:]:
+    lines = normalized.split("\n")[-scan_lines:]
+    for ln in lines:
         if ("╰" in ln and "╯" in ln) or ("╭" in ln and "╮" in ln):
             return True
-    return False
+    has_prompt = any(ln.lstrip().startswith("❯") for ln in lines)
+    has_long_rule = any(ln.count("─") >= 50 for ln in lines)
+    return has_prompt and has_long_rule
 
 
 # ---------- Classifier ----------
@@ -135,24 +147,44 @@ def classify(
 ) -> tuple[Classifier, dict]:
     info: dict = {"matched": []}
 
-    m = match_patterns(normalized, patterns.get("usageLimit", []))
-    if m:
-        info["matched"] = m
-        return Classifier.USAGE_LIMITED, info
-
+    # 1. BUSY first. Active work takes precedence over everything — including
+    #    soft "approaching limit" warnings that may be visible inline while
+    #    Claude is still happily working. We only act on hard limits, never
+    #    warnings.
     busy_m = match_patterns(normalized, patterns.get("busyMarkers", []))
     if busy_m or hash_unstable:
         info["matched"] = busy_m
         info["hashUnstable"] = hash_unstable
         return Classifier.BUSY, info
 
+    # 2. Menu-state detection. Without an input box rendered (or with the menu
+    #    nav footer visible) the screen is presenting a blocking choice.
     has_box = has_input_box(normalized, input_box_scan_lines)
     info["hasInputBox"] = has_box
-    menu_m = match_patterns(normalized, patterns.get("menuNavFooter", []))
-    if not has_box or menu_m:
-        info["matched"] = menu_m
+    menu_footer = match_patterns(normalized, patterns.get("menuNavFooter", []))
+    is_menu_up = (not has_box) or bool(menu_footer)
+
+    if is_menu_up:
+        # 2a. USAGE_LIMITED requires the SPECIFIC rate-limit menu to be on
+        #     screen — i.e., all configured menu options must match. This is
+        #     deliberately strict so that inline "approaching weekly limit"
+        #     warnings, "5-hour limit · resets at" status text, etc. never
+        #     classify as a hit. Only the actual blocking menu does.
+        usage_opts = patterns.get("usageLimitMenuOptions", [])
+        if usage_opts:
+            usage_hits = [o for o in usage_opts
+                          if match_patterns(normalized, [o])]
+            if len(usage_hits) == len(usage_opts):
+                info["matched"] = usage_hits
+                info["menuFooter"] = menu_footer
+                return Classifier.USAGE_LIMITED, info
+
+        # 2b. Generic menu (handled by _handle_menu rules elsewhere).
+        info["matched"] = menu_footer
         return Classifier.MENU, info
 
+    # 3. Free-text prompts (verification etc.) — input box present but no
+    #    busy markers and no menu state.
     vrf_m = match_patterns(normalized, patterns.get("verificationRequest", []))
     if vrf_m:
         info["matched"] = vrf_m
@@ -247,7 +279,8 @@ class Tmux:
 # ---------- Decision policy ----------
 
 def render_command(template: str, *, phase: str | None = None,
-                   prd: str | None = None, project: str | None = None) -> str:
+                   prd: str | None = None, project: str | None = None,
+                   verify_flag: str | None = None) -> str:
     out = template
     if phase is not None:
         out = out.replace("{phase}", phase)
@@ -255,6 +288,9 @@ def render_command(template: str, *, phase: str | None = None,
         out = out.replace("{prd}", prd)
     if project is not None:
         out = out.replace("{project}", project)
+    if verify_flag is not None:
+        out = out.replace("{verifyFlag}", verify_flag)
+    out = re.sub(r"  +", " ", out).strip()
     return out
 
 
@@ -322,6 +358,11 @@ class Controller:
         self.input_box_scan_lines = int(sess.get("inputBoxScanLines", DEFAULT_INPUT_BOX_SCAN_LINES))
         self.menu_max_nav_steps = int(sess.get("menuMaxNavigationSteps", DEFAULT_MENU_MAX_NAV_STEPS))
         self.menu_key_delay = float(sess.get("menuKeyDelaySeconds", DEFAULT_MENU_KEY_DELAY))
+        self.heartbeat_interval = float(sess.get("heartbeatIntervalSeconds", 300))
+
+        # Per-run signals for liveness logging
+        self.last_classifier: str | None = None
+        self.last_heartbeat_at: float = 0.0
 
     def _log_level(self) -> int:
         return {
@@ -455,6 +496,43 @@ class Controller:
                     f"matched={info.get('matched')}"
                 )
 
+            # Classifier-change line: log when the per-poll classification flips.
+            # Catches BUSY→IDLE (Claude finished a step), IDLE→BUSY (started), and
+            # any USAGE_LIMITED/MENU/TEXT_PROMPT entry/exit. One line per change,
+            # not per poll, so it stays readable during long busy stretches.
+            if classifier.value != self.last_classifier:
+                matched = info.get("matched") or []
+                tail = f" matched={matched}" if matched else ""
+                from_label = self.last_classifier or "?"
+                self.logger.info(
+                    f"classifier: {from_label} -> {classifier.value}{tail}"
+                )
+                self.last_classifier = classifier.value
+
+            # Heartbeat: emit a status summary every heartbeat_interval seconds even
+            # if nothing changed. Without this, the log can go silent for hours
+            # during busy phases and you can't tell if the controller is alive.
+            now_ts = time.time()
+            if now_ts - self.last_heartbeat_at >= self.heartbeat_interval:
+                last_action = self.state.lastActionTimestamp
+                if last_action:
+                    try:
+                        last_dt = dt.datetime.fromisoformat(last_action)
+                        ago_s = int((dt.datetime.now() - last_dt).total_seconds())
+                        h, rem = divmod(ago_s, 3600)
+                        m, s = divmod(rem, 60)
+                        ago = f"{h}h{m:02d}m" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
+                    except (ValueError, TypeError):
+                        ago = "?"
+                else:
+                    ago = "never"
+                self.logger.info(
+                    f"heartbeat: poll=#{self.state.pollCount} state={self.state.state} "
+                    f"classifier={classifier.value} stable={self.stable_count} "
+                    f"lastAction={ago}"
+                )
+                self.last_heartbeat_at = now_ts
+
             paused = self.paths["pause_flag"].exists()
             if not paused:
                 try:
@@ -566,7 +644,9 @@ class Controller:
             tmpl_key = "withResearch" if mode == "with_research" else "withoutResearch"
             tmpl = self.config["commands"]["plan"][tmpl_key]
             prd = self.config["project"].get("prdPath", "")
-            self._send_major_command(tmpl, phase=phase, prd=prd)
+            skip_verify = bool(self.config["policy"].get("skipPlanVerification", False))
+            verify_flag = "--skip-verify" if skip_verify else ""
+            self._send_major_command(tmpl, phase=phase, prd=prd, verify_flag=verify_flag)
         else:
             self.logger.warning(f"unknown decision.next={decision['next']}; pausing")
             self._transition(State.PAUSED_FOR_HUMAN, reason="unknown decision branch")
@@ -574,13 +654,15 @@ class Controller:
 
         self._transition(State.RUNNING, reason="action sent")
 
-    def _send_major_command(self, template: str, *, phase: str, prd: str = "") -> None:
+    def _send_major_command(self, template: str, *, phase: str, prd: str = "",
+                             verify_flag: str = "") -> None:
         if self.paths["stop_next_flag"].exists():
             self.logger.warning("stop-next requested; refusing to send major command")
             self._transition(State.COMPLETE, reason="stop-next")
             return
 
-        cmd = render_command(template, phase=phase, prd=prd, project=self.repo.name)
+        cmd = render_command(template, phase=phase, prd=prd,
+                             project=self.repo.name, verify_flag=verify_flag)
 
         if cmd == self.state.lastCommandSent:
             self.state.retryCounts["sameMajor"] = self.state.retryCounts.get("sameMajor", 0) + 1
@@ -632,16 +714,23 @@ class Controller:
 
     def _navigate_to_option(self, normalized: str, target_pattern: str) -> None:
         lines = normalized.split("\n")
+        # Scan BOTTOM-UP. Menus always render at the bottom of the terminal,
+        # and the input box ❯ prompt of whatever the user typed to invoke the
+        # menu (e.g. `❯ /rate-limit-options`) usually still sits visible
+        # ABOVE the menu region. A top-down scan for ❯ would lock onto that
+        # prompt and produce a wildly wrong cursor distance — leading to
+        # wrap-around and the wrong option being selected (e.g. Upgrade
+        # instead of Wait). Bottom-up reliably finds the menu's own cursor
+        # and the menu-option line for the target pattern.
         cursor_idx = None
         target_idx = None
-        for i, ln in enumerate(lines):
-            # Use the ❯ glyph as the only cursor signal. The bare ">" was previously
-            # accepted as a fallback, but it false-positives on the input box's own
-            # ">" prompt and on quoted/blockquote lines.
-            if cursor_idx is None and "❯" in ln:
+        for i in range(len(lines) - 1, -1, -1):
+            if cursor_idx is None and "❯" in lines[i]:
                 cursor_idx = i
-            if target_idx is None and re.search(target_pattern, ln, re.IGNORECASE):
+            if target_idx is None and re.search(target_pattern, lines[i], re.IGNORECASE):
                 target_idx = i
+            if cursor_idx is not None and target_idx is not None:
+                break
 
         if cursor_idx is None or target_idx is None:
             self.logger.warning(
@@ -714,11 +803,22 @@ class Controller:
             self._transition(State.PAUSED_FOR_HUMAN, reason="usage reset attempts exhausted")
             return
 
-        for opt in self.config["patterns"].get("waitForResetOption", []):
-            if re.search(opt, normalized, re.IGNORECASE):
-                self._transition(State.INTERACTIVE_MENU, reason="usage-reset menu visible")
-                self._handle_menu(normalized)
-                return
+        # The Claude Code rate-limit menu always presents "Stop and wait for
+        # limit to reset" as option 1 with the cursor pre-selected on it.
+        # Just press Enter — no cursor detection or arrow-key navigation
+        # needed. This avoids an entire class of menu-navigation bugs that
+        # otherwise show up when the input prompt's ❯ confuses cursor scans.
+        # If Claude Code ever changes the default option order, the worst
+        # case is we accidentally select Upgrade once and the user notices
+        # — far better than the convoluted scan-and-jump logic.
+        self.logger.info("usage-limit menu detected; pressing Enter on default option")
+        try:
+            self.tmux.send_keys("Enter")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            self.logger.error(f"usage-limit Enter send-keys failed: {e}")
+            self._transition(State.PAUSED_FOR_HUMAN, reason=f"send-keys failed: {e}")
+            return
+        self._emit_action(kind="key", text="Enter")
 
         wait_min = self.config["policy"].get("usageResetWaitMinutes", 15)
         self.state.usageResetAttempts += 1
@@ -726,10 +826,10 @@ class Controller:
             dt.datetime.now() + dt.timedelta(minutes=wait_min)
         ).isoformat()
         self.logger.info(
-            f"usage limited; passive wait until {self.state.waitingResetUntil} "
-            f"(attempt {self.state.usageResetAttempts}/{max_attempts})"
+            f"usage limited; selected default (Stop and wait); waiting until "
+            f"{self.state.waitingResetUntil} (attempt {self.state.usageResetAttempts}/{max_attempts})"
         )
-        self._transition(State.WAITING_FOR_RESET, reason="passive wait")
+        self._transition(State.WAITING_FOR_RESET, reason="rate-limit menu Enter on default")
 
     def _handle_waiting_for_reset(self, classifier: Classifier, normalized: str) -> None:
         if self.state.waitingResetUntil:
@@ -783,12 +883,20 @@ class Controller:
             "You are a CLI orchestration assistant inspecting one terminal screen.\n"
             "Decide ONE next action.\n\n"
             "Output ONLY a JSON object of the form:\n"
-            '{"decision": "send_text" | "pause_for_human", '
-            '"text": "<must exactly match one of the allowed strings>", '
+            '{"decision": "send_text" | "wait" | "pause_for_human", '
+            '"text": "<required only when decision=send_text; otherwise null>", '
             '"reason": "<<=200 chars>", "confidence": "high" | "low"}\n\n'
-            f"Allowed text values (case-insensitive exact match): {json.dumps(whitelist)}\n"
-            "You MAY NOT issue slash commands. You MAY NOT navigate menus. "
-            "If the safe action is not unambiguous, return decision=pause_for_human.\n\n"
+            "Decision semantics:\n"
+            "- send_text: respond with a specific allowed text now.\n"
+            "- wait: no action needed; the screen will resolve autonomously "
+            "(subagents running, async task in progress, parallel worktrees, etc.). "
+            "Controller will keep observing — DO NOT use this for human-intervention scenarios.\n"
+            "- pause_for_human: a human must intervene (unrecognized prompt, error, "
+            "decision genuinely requiring judgment). Controller halts injection.\n\n"
+            f"Allowed text values for send_text (case-insensitive exact match): {json.dumps(whitelist)}\n"
+            "You MAY NOT issue slash commands. You MAY NOT navigate menus.\n"
+            "If the safe action is not unambiguous AND no autonomous resolution is in progress, "
+            "return decision=pause_for_human.\n\n"
             f"Controller state: {self.state.state}\n"
             f"Last command sent: {self.state.lastCommandSent!r}\n"
             f"Last phase: {self.state.lastPhase!r}\n\n"
@@ -829,12 +937,19 @@ class Controller:
             self._transition(State.PAUSED_FOR_HUMAN, reason="LLM non-JSON response")
             return
 
+        # Schema: decision is required and one of three known values.
+        # text is REQUIRED only for send_text — for wait/pause_for_human it
+        # may be null/empty (LLM has nothing to send and the controller does
+        # nothing or pauses, in either case no text is consumed).
+        decision = decision_obj.get("decision") if isinstance(decision_obj, dict) else None
         valid = (
             isinstance(decision_obj, dict)
-            and decision_obj.get("decision") in ("send_text", "pause_for_human")
-            and isinstance(decision_obj.get("text", ""), str)
+            and decision in ("send_text", "wait", "pause_for_human")
             and isinstance(decision_obj.get("reason", ""), str)
         )
+        if valid and decision == "send_text":
+            t = decision_obj.get("text")
+            valid = isinstance(t, str) and bool(t.strip())
         if not valid:
             self.logger.warning(f"LLM fallback failed schema validation: {decision_obj}")
             self._transition(State.PAUSED_FOR_HUMAN, reason="LLM schema invalid")
@@ -848,7 +963,18 @@ class Controller:
             }
         )
 
-        if decision_obj["decision"] == "pause_for_human":
+        if decision == "wait":
+            # Autonomous resolution in progress (subagents running, async task,
+            # parallel worktrees, etc.). Stay in RUNNING and keep observing —
+            # explicitly NOT a human-intervention pause.
+            self.logger.info(
+                f"LLM advised wait: {decision_obj.get('reason')} "
+                f"(confidence={decision_obj.get('confidence')})"
+            )
+            self._transition(State.RUNNING, reason="LLM wait — autonomous resolution")
+            return
+
+        if decision == "pause_for_human":
             self.logger.info(f"LLM advised pause: {decision_obj.get('reason')}")
             self._transition(State.PAUSED_FOR_HUMAN, reason="LLM pause_for_human")
             return
@@ -905,6 +1031,18 @@ def validate_config(cfg: dict) -> list[str]:
     pol = cfg.get("policy", {})
     if pol.get("defaultPlanMode") not in ("with_research", "without_research", None):
         errors.append("policy.defaultPlanMode must be with_research or without_research")
+    if "skipPlanVerification" in pol and not isinstance(pol["skipPlanVerification"], bool):
+        errors.append("policy.skipPlanVerification must be a boolean")
+
+    if "model" in sess:
+        v = sess["model"]
+        if not isinstance(v, str) or not v.strip():
+            errors.append("session.model must be a non-empty string (e.g. 'default' or 'claude-opus-4-6[1m]')")
+
+    if "heartbeatIntervalSeconds" in sess:
+        v = sess["heartbeatIntervalSeconds"]
+        if not isinstance(v, (int, float)) or v <= 0:
+            errors.append("session.heartbeatIntervalSeconds must be a positive number")
 
     return errors
 
@@ -928,6 +1066,58 @@ def session_name_for(repo: pathlib.Path, cfg: dict) -> str:
 
 
 # ---------- CLI commands ----------
+
+CLAUDE_MD_BEGIN = "<!-- gsd-auto:begin -->"
+CLAUDE_MD_END = "<!-- gsd-auto:end -->"
+
+CLAUDE_MD_DIRECTIVES = """\
+# gsd-auto runtime directives
+
+This project is being driven by **gsd-auto-v4**, an automated terminal controller. Until you see this block removed, behave as follows so the controller can run unattended:
+
+- **Defer all UAT and manual verification to end of milestone.** When a workflow step asks for "manual UAT", "please test", "please confirm", "verification required", or any equivalent runtime confirmation, **respond by deferring** — record the deferral in the artifact (e.g. STATE.md / VERIFICATION.md "Deferred Items"), continue the workflow, and let the milestone close-out collect them. Do not block phase progression on UAT.
+- **Do not ask the operator for confirmation on routine decisions.** If a sensible default exists, take it and note it in the relevant artifact. Save questions for genuinely ambiguous calls.
+- **Avoid spawning interactive TUI menus during phase execution.** Plan-phase already runs with `--text` (plain numbered prompts). For execute-phase and other workflows, prefer plain-text prompts the controller's LLM-fallback whitelist can answer (`continue`, `y`, `n`, `defer to end of milestone verification`, `approve`, `fix the bug now`).
+- **Treat usage-limit warnings as informational, not blocking.** Approaching/inline limit warnings should not pause work. The controller handles the actual blocking rate-limit menu (Stop and wait + 15-min retry loop) on its own.
+- **Stop the workflow when you genuinely need a human.** If a decision truly requires the operator (architectural fork, security review, irreversible destructive op), pause and surface the decision clearly — the controller will route it via PAUSED_FOR_HUMAN. Do not invent an answer.
+"""
+
+
+def _ensure_claude_md_directives(repo: pathlib.Path) -> None:
+    """Inject (or refresh) the gsd-auto directive block at the top of CLAUDE.md.
+
+    Idempotent: re-running init replaces the existing managed block in place
+    without disturbing the rest of the file. The block is bounded by HTML
+    comment markers so users can find/edit/delete it manually if needed.
+    """
+    claude_md = repo / "CLAUDE.md"
+    block = f"{CLAUDE_MD_BEGIN}\n{CLAUDE_MD_DIRECTIVES}{CLAUDE_MD_END}\n"
+
+    if not claude_md.exists():
+        claude_md.write_text(block)
+        print(f"[gsd-auto-v4] created {claude_md} with gsd-auto directives")
+        return
+
+    existing = claude_md.read_text()
+    if CLAUDE_MD_BEGIN in existing and CLAUDE_MD_END in existing:
+        # Replace existing managed block in place.
+        pattern = re.compile(
+            re.escape(CLAUDE_MD_BEGIN) + r".*?" + re.escape(CLAUDE_MD_END) + r"\n?",
+            re.DOTALL,
+        )
+        new_text = pattern.sub(block, existing, count=1)
+        if new_text != existing:
+            claude_md.write_text(new_text)
+            print(f"[gsd-auto-v4] refreshed gsd-auto directives in {claude_md}")
+        else:
+            print(f"[gsd-auto-v4] gsd-auto directives in {claude_md} already up to date")
+    else:
+        # Prepend the block at the top, preserving everything below.
+        if existing and not existing.endswith("\n"):
+            existing += "\n"
+        claude_md.write_text(block + "\n" + existing)
+        print(f"[gsd-auto-v4] prepended gsd-auto directives to {claude_md}")
+
 
 def cmd_init(_args) -> None:
     repo = pathlib.Path.cwd()
@@ -959,6 +1149,8 @@ def cmd_init(_args) -> None:
     else:
         gitignore.write_text(line + "\n")
         print(f"[gsd-auto-v4] created .gitignore with {line}")
+
+    _ensure_claude_md_directives(repo)
 
     print(f"[gsd-auto-v4] init complete: {cfg_dir}")
     print("Next: edit gsd-auto/config.json if needed, then `gsd-auto-v4 run`.")
@@ -1006,6 +1198,8 @@ def cmd_run(_args) -> None:
             tmux.new_session()
             time.sleep(0.5)
             launch = cfg["session"]["claudeLaunchCommand"]
+            model = cfg["session"].get("model", "default")
+            launch = launch.replace("{model}", model)
             print(f"[gsd-auto-v4] launching Claude: {launch}")
             tmux.send_text_enter(launch)
             time.sleep(2)
@@ -1129,6 +1323,64 @@ def cmd_stop_next(_args) -> None:
     print("The controller will transition to COMPLETE before injecting another major command.")
 
 
+def cmd_kill(_args) -> None:
+    repo = pathlib.Path.cwd()
+    paths = runtime_paths(repo)
+
+    killed_controller = False
+    if paths["pid"].exists():
+        try:
+            pid = int(paths["pid"].read_text().strip())
+        except (ValueError, OSError):
+            pid = 0
+        if pid > 0 and is_pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            for _ in range(20):
+                if not is_pid_alive(pid):
+                    break
+                time.sleep(0.1)
+            if is_pid_alive(pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            print(f"[gsd-auto-v4] killed controller (PID {pid})")
+            killed_controller = True
+        else:
+            print(f"[gsd-auto-v4] no live controller for PID file (stale)")
+        try:
+            paths["pid"].unlink()
+        except FileNotFoundError:
+            pass
+    else:
+        print("[gsd-auto-v4] no controller PID file")
+
+    killed_session = False
+    try:
+        cfg = load_config(repo)
+        session = session_name_for(repo, cfg)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"[gsd-auto-v4] cannot resolve session name: {e}")
+        session = None
+    if session:
+        tmux = Tmux(session)
+        if tmux.has_session():
+            subprocess.run(
+                ["tmux", "kill-session", "-t", session],
+                check=False,
+            )
+            print(f"[gsd-auto-v4] killed tmux session: {session}")
+            killed_session = True
+        else:
+            print(f"[gsd-auto-v4] no tmux session: {session}")
+
+    if not killed_controller and not killed_session:
+        print("[gsd-auto-v4] nothing to kill")
+
+
 def cmd_tail(args) -> None:
     paths = runtime_paths(pathlib.Path.cwd())
     log = paths["log"]
@@ -1169,6 +1421,8 @@ def cmd_doctor(_args) -> None:
                 project = repo.name
                 prd = cfg["project"].get("prdPath", "") if "project" in cfg else ""
                 phase = "00.0"
+                skip_verify = bool(cfg.get("policy", {}).get("skipPlanVerification", False))
+                verify_flag = "--skip-verify" if skip_verify else ""
                 templates = []
                 if "plan" in cfg["commands"]:
                     if "withResearch" in cfg["commands"]["plan"]:
@@ -1179,8 +1433,14 @@ def cmd_doctor(_args) -> None:
                     if "default" in cfg["commands"]["execute"]:
                         templates.append(("execute.default", cfg["commands"]["execute"]["default"]))
                 for label, tmpl in templates:
-                    rendered = render_command(tmpl, phase=phase, prd=prd, project=project)
+                    rendered = render_command(tmpl, phase=phase, prd=prd,
+                                              project=project, verify_flag=verify_flag)
                     print(f"[ok] template {label}: {rendered}")
+                print(f"[info] skipPlanVerification: {skip_verify}")
+                model = cfg.get("session", {}).get("model", "default")
+                launch_preview = cfg["session"]["claudeLaunchCommand"].replace("{model}", model)
+                print(f"[info] model: {model}")
+                print(f"[info] launch command: {launch_preview}")
                 if shutil.which("tmux"):
                     session = session_name_for(repo, cfg)
                     if Tmux(session).has_session():
@@ -1224,6 +1484,7 @@ def main() -> None:
     sub.add_parser("pause", help="Pause action injection")
     sub.add_parser("resume", help="Resume action injection")
     sub.add_parser("stop-next", help="Allow current task to finish, then COMPLETE")
+    sub.add_parser("kill", help="Hard-kill controller process and tmux session")
 
     pt = sub.add_parser("tail", help="Tail controller log")
     pt.add_argument("-f", "--follow", action="store_true", help="Follow new log lines")
@@ -1241,6 +1502,7 @@ def main() -> None:
         "pause": cmd_pause,
         "resume": cmd_resume,
         "stop-next": cmd_stop_next,
+        "kill": cmd_kill,
         "tail": cmd_tail,
         "doctor": cmd_doctor,
         "_loop": cmd_loop,
