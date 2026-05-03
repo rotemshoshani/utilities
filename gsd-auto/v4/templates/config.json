@@ -12,6 +12,7 @@
     "clearToMajorDelaySeconds": 1.5,
     "maxIdenticalMajorCommands": 2,
     "inputBoxScanLines": 5,
+    "busyMarkerScanLines": 30,
     "menuMaxNavigationSteps": 40,
     "menuKeyDelaySeconds": 0.1,
     "heartbeatIntervalSeconds": 300

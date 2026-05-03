@@ -34,6 +34,7 @@ TMUX_TIMEOUT_SECONDS = 5
 DEFAULT_CLEAR_TO_MAJOR_DELAY = 1.5
 DEFAULT_MAX_IDENTICAL_MAJOR = 2
 DEFAULT_INPUT_BOX_SCAN_LINES = 5
+DEFAULT_BUSY_MARKER_SCAN_LINES = 30
 DEFAULT_MENU_MAX_NAV_STEPS = 40
 DEFAULT_MENU_KEY_DELAY = 0.1
 
@@ -144,6 +145,7 @@ def classify(
     hash_unstable: bool,
     patterns: dict,
     input_box_scan_lines: int = DEFAULT_INPUT_BOX_SCAN_LINES,
+    busy_marker_scan_lines: int = DEFAULT_BUSY_MARKER_SCAN_LINES,
 ) -> tuple[Classifier, dict]:
     info: dict = {"matched": []}
 
@@ -151,7 +153,14 @@ def classify(
     #    soft "approaching limit" warnings that may be visible inline while
     #    Claude is still happily working. We only act on hard limits, never
     #    warnings.
-    busy_m = match_patterns(normalized, patterns.get("busyMarkers", []))
+    #    Scan only the live tail of the pane: active busy indicators
+    #    ("esc to interrupt", spinner timer, "ctrl+b ctrl+b twice to background",
+    #    "Waiting for completion notifications") are always rendered immediately
+    #    above the input box. Matching against full scrollback wedges the
+    #    classifier on stale text from completed tool output.
+    busy_window = "\n".join(normalized.split("\n")[-busy_marker_scan_lines:]) \
+        if busy_marker_scan_lines > 0 else normalized
+    busy_m = match_patterns(busy_window, patterns.get("busyMarkers", []))
     if busy_m or hash_unstable:
         info["matched"] = busy_m
         info["hashUnstable"] = hash_unstable
@@ -356,6 +365,7 @@ class Controller:
         self.clear_to_major_delay = float(sess.get("clearToMajorDelaySeconds", DEFAULT_CLEAR_TO_MAJOR_DELAY))
         self.max_identical_major = int(sess.get("maxIdenticalMajorCommands", DEFAULT_MAX_IDENTICAL_MAJOR))
         self.input_box_scan_lines = int(sess.get("inputBoxScanLines", DEFAULT_INPUT_BOX_SCAN_LINES))
+        self.busy_marker_scan_lines = int(sess.get("busyMarkerScanLines", DEFAULT_BUSY_MARKER_SCAN_LINES))
         self.menu_max_nav_steps = int(sess.get("menuMaxNavigationSteps", DEFAULT_MENU_MAX_NAV_STEPS))
         self.menu_key_delay = float(sess.get("menuKeyDelaySeconds", DEFAULT_MENU_KEY_DELAY))
         self.heartbeat_interval = float(sess.get("heartbeatIntervalSeconds", 300))
@@ -484,6 +494,7 @@ class Controller:
             classifier, info = classify(
                 normalized, unstable, self.config["patterns"],
                 input_box_scan_lines=self.input_box_scan_lines,
+                busy_marker_scan_lines=self.busy_marker_scan_lines,
             )
 
             self.logger.debug(

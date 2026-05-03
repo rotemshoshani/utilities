@@ -517,7 +517,7 @@ Each poll runs this pipeline:
 4. Detect input box presence in the bottom rows
 5. Run priority-ordered content detectors and stop at the first match:
    1. **usage-limit** — keyword match against `patterns.usageLimit`
-   2. **busy** — keyword match against `patterns.busyMarkers` OR hash unstable since last poll. Either condition is sufficient.
+   2. **busy** — keyword match against `patterns.busyMarkers` OR hash unstable since last poll. Either condition is sufficient. Busy keywords are matched only against the live tail of the pane (last `session.busyMarkerScanLines` rows, default 30) so stale tool-output text in scrollback (e.g. the lingering `(ctrl+b ctrl+b (twice) to run in background)` hint) cannot wedge the classifier on `busy` after the session has gone idle.
    3. **menu** — input box absent in bottom rows OR keyword match against `patterns.menuNavFooter`. Either condition is sufficient. Bare checkbox glyphs (`[ ]`, `[x]`) do not qualify — they appear in agent task progress lists.
    4. **text-prompt** — keyword match against `patterns.verificationRequest` or other configured prompts; requires input box present.
    5. **idle** — none of the above matched.
