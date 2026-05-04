@@ -99,8 +99,9 @@ This:
 
 1. creates the tmux session if it doesn't exist (`gsd-auto-<project>`)
 2. launches Claude with `--dangerously-skip-permissions`
-3. forks the polling loop into the background (PID written to `gsd-auto/runtime/controller.pid`)
-4. attaches your current terminal to the tmux session
+3. waits briefly for Claude to start, then sends `/rename <session>` and `/remote-control <session>` into the Claude session
+4. forks the polling loop into the background (PID written to `gsd-auto/runtime/controller.pid`)
+5. attaches your current terminal to the tmux session
 
 **You type the first command** (e.g., `/gsd-execute-phase 105`). After the first busy→idle cycle, the controller takes over.
 

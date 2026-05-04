@@ -48,7 +48,7 @@ This avoids the false-positive trap where pure timing-based "is the screen stabl
 
 ### Bootstrap
 
-The controller is intentionally not omniscient. The human types the first command after the session starts. A runtime flag `hasObservedFirstCycle` suppresses decision-making until the first `busy` classification fires. The same flag persists across crashes — a restarted controller resumes immediately without waiting for human input.
+On a fresh tmux session, startup launches Claude, waits briefly for it to start, then sends `/rename <session>` followed by `/remote-control <session>` before attaching. The controller is intentionally not omniscient after that bootstrap. The human types the first workflow command after the session starts. A runtime flag `hasObservedFirstCycle` suppresses decision-making until the first `busy` classification fires. The same flag persists across crashes — a restarted controller resumes immediately without waiting for human input.
 
 ### Decision policy
 

@@ -13,6 +13,7 @@ import logging
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -29,6 +30,7 @@ CONFIG_REL = pathlib.Path("gsd-auto/config.json")
 RUNTIME_REL = pathlib.Path("gsd-auto/runtime")
 
 TMUX_TIMEOUT_SECONDS = 5
+CLAUDE_STARTUP_COMMANDS = ("/rename", "/remote-control")
 
 # Defaults for session.* values that are read once at controller start.
 DEFAULT_CLEAR_TO_MAJOR_DELAY = 1.5
@@ -1076,6 +1078,11 @@ def session_name_for(repo: pathlib.Path, cfg: dict) -> str:
     return cfg["session"]["tmuxSessionName"].replace("{project}", repo.name)
 
 
+def claude_startup_commands(session: str) -> list[str]:
+    session_arg = shlex.quote(session)
+    return [f"{cmd} {session_arg}" for cmd in CLAUDE_STARTUP_COMMANDS]
+
+
 # ---------- CLI commands ----------
 
 CLAUDE_MD_BEGIN = "<!-- gsd-auto:begin -->"
@@ -1213,7 +1220,11 @@ def cmd_run(_args) -> None:
             launch = launch.replace("{model}", model)
             print(f"[gsd-auto-v4] launching Claude: {launch}")
             tmux.send_text_enter(launch)
-            time.sleep(2)
+            time.sleep(5)
+            for startup_command in claude_startup_commands(session):
+                print(f"[gsd-auto-v4] running Claude startup command: {startup_command}")
+                tmux.send_text_enter(startup_command)
+                time.sleep(2)
         else:
             print(f"[gsd-auto-v4] tmux session exists: {session}")
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
