@@ -30,7 +30,10 @@ CONFIG_REL = pathlib.Path("gsd-auto/config.json")
 RUNTIME_REL = pathlib.Path("gsd-auto/runtime")
 
 TMUX_TIMEOUT_SECONDS = 5
+CLAUDE_STARTUP_DELAY_SECONDS = 5
+CLAUDE_STARTUP_COMMAND_DELAY_SECONDS = 2
 CLAUDE_STARTUP_COMMANDS = ("/rename", "/remote-control")
+PLANNING_PHASE_PLACEHOLDER = "<phase>"
 
 # Defaults for session.* values that are read once at controller start.
 DEFAULT_CLEAR_TO_MAJOR_DELAY = 1.5
@@ -249,6 +252,7 @@ class RuntimeState:
 class Tmux:
     def __init__(self, session: str):
         self.session = session
+        self._main_pane: str | None = None
 
     def has_session(self) -> bool:
         try:
@@ -266,9 +270,21 @@ class Tmux:
             args.append(command)
         subprocess.run(args, check=True, timeout=TMUX_TIMEOUT_SECONDS)
 
+    def main_pane(self) -> str:
+        if self._main_pane:
+            return self._main_pane
+        r = subprocess.run(
+            ["tmux", "list-panes", "-t", self.session, "-F", "#{pane_id}"],
+            check=True, capture_output=True, text=True,
+            timeout=TMUX_TIMEOUT_SECONDS,
+        )
+        panes = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+        self._main_pane = panes[0] if panes else self.session
+        return self._main_pane
+
     def capture_pane(self, lines: int) -> str:
         r = subprocess.run(
-            ["tmux", "capture-pane", "-t", self.session, "-p", "-e", "-J", "-S", f"-{lines}"],
+            ["tmux", "capture-pane", "-t", self.main_pane(), "-p", "-e", "-J", "-S", f"-{lines}"],
             capture_output=True, text=True, errors="replace",
             timeout=TMUX_TIMEOUT_SECONDS,
         )
@@ -276,13 +292,33 @@ class Tmux:
 
     def send_keys(self, *keys: str) -> None:
         subprocess.run(
-            ["tmux", "send-keys", "-t", self.session, *keys],
+            ["tmux", "send-keys", "-t", self.main_pane(), *keys],
             check=True, timeout=TMUX_TIMEOUT_SECONDS,
         )
 
     def send_text_enter(self, text: str) -> None:
         subprocess.run(
-            ["tmux", "send-keys", "-t", self.session, text, "Enter"],
+            ["tmux", "send-keys", "-t", self.main_pane(), text, "Enter"],
+            check=True, timeout=TMUX_TIMEOUT_SECONDS,
+        )
+
+    def split_window(self, *, target: str, cwd: pathlib.Path, command: str,
+                     horizontal: bool = False, percent: int | None = None) -> str:
+        args = ["tmux", "split-window"]
+        if horizontal:
+            args.append("-h")
+        if percent is not None:
+            args.extend(["-p", str(percent)])
+        args.extend(["-t", target, "-c", str(cwd), "-P", "-F", "#{pane_id}", command])
+        r = subprocess.run(
+            args, check=True, capture_output=True, text=True,
+            timeout=TMUX_TIMEOUT_SECONDS,
+        )
+        return r.stdout.strip()
+
+    def select_main_pane(self) -> None:
+        subprocess.run(
+            ["tmux", "select-pane", "-t", self.main_pane()],
             check=True, timeout=TMUX_TIMEOUT_SECONDS,
         )
 
@@ -1083,6 +1119,51 @@ def claude_startup_commands(session: str) -> list[str]:
     return [f"{cmd} {session_arg}" for cmd in CLAUDE_STARTUP_COMMANDS]
 
 
+def planning_command_preview(repo: pathlib.Path, cfg: dict) -> tuple[str, str]:
+    mode = cfg["policy"].get("defaultPlanMode", "without_research")
+    tmpl_key = "withResearch" if mode == "with_research" else "withoutResearch"
+    tmpl = cfg["commands"]["plan"][tmpl_key]
+    prd = cfg.get("project", {}).get("prdPath", "")
+    skip_verify = bool(cfg["policy"].get("skipPlanVerification", False))
+    verify_flag = "--skip-verify" if skip_verify else ""
+    command = render_command(
+        tmpl,
+        phase=PLANNING_PHASE_PLACEHOLDER,
+        prd=prd,
+        project=repo.name,
+        verify_flag=verify_flag,
+    )
+    return tmpl_key, command
+
+
+def setup_observer_panes(tmux: Tmux, repo: pathlib.Path, cfg: dict) -> None:
+    tail_command = f"{shlex.quote(str(SCRIPT_PATH))} tail -f"
+    log_pane = tmux.split_window(
+        target=tmux.main_pane(),
+        cwd=repo,
+        command=tail_command,
+        percent=25,
+    )
+
+    tmpl_key, command = planning_command_preview(repo, cfg)
+    preview_text = (
+        "Planning command preview\n"
+        f"Config key: commands.plan.{tmpl_key}\n"
+        f"Phase placeholder: {PLANNING_PHASE_PLACEHOLDER}\n"
+        "\n"
+        f"{command}\n"
+    )
+    preview_command = f"printf '%s' {shlex.quote(preview_text)}; exec \"${{SHELL:-/bin/sh}}\""
+    tmux.split_window(
+        target=log_pane,
+        cwd=repo,
+        command=preview_command,
+        horizontal=True,
+        percent=35,
+    )
+    tmux.select_main_pane()
+
+
 # ---------- CLI commands ----------
 
 CLAUDE_MD_BEGIN = "<!-- gsd-auto:begin -->"
@@ -1220,11 +1301,13 @@ def cmd_run(_args) -> None:
             launch = launch.replace("{model}", model)
             print(f"[gsd-auto-v4] launching Claude: {launch}")
             tmux.send_text_enter(launch)
-            time.sleep(5)
+            time.sleep(CLAUDE_STARTUP_DELAY_SECONDS)
             for startup_command in claude_startup_commands(session):
                 print(f"[gsd-auto-v4] running Claude startup command: {startup_command}")
                 tmux.send_text_enter(startup_command)
-                time.sleep(2)
+                time.sleep(CLAUDE_STARTUP_COMMAND_DELAY_SECONDS)
+            print("[gsd-auto-v4] creating observer panes")
+            setup_observer_panes(tmux, repo, cfg)
         else:
             print(f"[gsd-auto-v4] tmux session exists: {session}")
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
@@ -1406,13 +1489,14 @@ def cmd_kill(_args) -> None:
 def cmd_tail(args) -> None:
     paths = runtime_paths(pathlib.Path.cwd())
     log = paths["log"]
+    if args.follow:
+        paths["root"].mkdir(parents=True, exist_ok=True)
+        log.touch(exist_ok=True)
+        os.execvp("tail", ["tail", "-F", str(log)])
     if not log.exists():
         print(f"[gsd-auto-v4] log not found: {log}")
         return
-    if args.follow:
-        os.execvp("tail", ["tail", "-F", str(log)])
-    else:
-        os.execvp("tail", ["tail", "-n", str(args.lines), str(log)])
+    os.execvp("tail", ["tail", "-n", str(args.lines), str(log)])
 
 
 def cmd_doctor(_args) -> None:
