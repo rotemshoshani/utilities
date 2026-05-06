@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pomodoro-tui"
+version = "0.1.0"
+description = "A terminal Pomodoro++ timer that splits work into point-scoring chunks."
+requires-python = ">=3.10"
+authors = [{ name = "Pomodoro TUI" }]
+readme = "README.md"
+
+[project.scripts]
+pomodoro-tui = "pomodoro_tui.cli:main"
+pomopp = "pomodoro_tui.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
