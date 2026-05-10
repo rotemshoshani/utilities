@@ -118,6 +118,12 @@ gsd-auto-v4 pause       # immediately stop injecting actions (controller keeps o
 gsd-auto-v4 resume      # un-pause
 ```
 
+To stop only the controller process while keeping the tmux session and Claude inside it alive:
+
+```bash
+gsd-auto-v4 kill-controller
+```
+
 To hard-kill everything (controller process + tmux session, no graceful shutdown):
 
 ```bash

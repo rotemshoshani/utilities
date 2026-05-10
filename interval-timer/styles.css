@@ -1,0 +1,485 @@
+:root {
+  color-scheme: dark;
+  --bg: oklch(13% 0.012 92);
+  --panel: oklch(19% 0.014 92);
+  --panel-strong: oklch(24% 0.016 92);
+  --line: oklch(36% 0.018 92);
+  --ink: oklch(94% 0.012 92);
+  --muted: oklch(70% 0.02 92);
+  --dim: oklch(54% 0.018 92);
+  --accent: oklch(77% 0.15 74);
+  --radius: 8px;
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 12px;
+  --space-lg: 16px;
+  --space-xl: 24px;
+  --space-2xl: 32px;
+  font-family:
+    Avenir Next, Avenir, "Segoe UI", "Helvetica Neue", Helvetica, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  color: var(--ink);
+  background: var(--bg);
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button,
+.file-button {
+  cursor: pointer;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: var(--space-xl);
+  width: min(1280px, calc(100% - 32px));
+  min-height: 100vh;
+  margin: 0 auto;
+  padding: var(--space-xl) 0;
+}
+
+.runner {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: var(--space-lg);
+  min-height: calc(100vh - 48px);
+}
+
+.runner-controls {
+  display: grid;
+  grid-template-columns: 88px 112px 88px;
+  justify-content: center;
+  align-items: center;
+  gap: var(--space-lg);
+}
+
+.round-button {
+  display: grid;
+  place-items: center;
+  width: 88px;
+  height: 88px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--ink);
+  background: var(--panel);
+  font-size: 2.4rem;
+  font-weight: 800;
+}
+
+.play-button {
+  width: 112px;
+  height: 112px;
+  color: oklch(16% 0.016 74);
+  background: var(--accent);
+  font-size: 2.2rem;
+}
+
+.timer-card,
+.template-panel,
+.creator-panel,
+.interval-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+.timer-card {
+  display: grid;
+  align-content: center;
+  gap: var(--space-xl);
+  min-height: 540px;
+  padding: var(--space-2xl);
+}
+
+.phase-meta,
+.panel-header,
+.section-heading,
+.interval-topline,
+.runner-footer,
+.save-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+}
+
+.phase-meta {
+  color: var(--muted);
+  font-size: 0.95rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.time-readout {
+  color: var(--accent);
+  font-size: 12rem;
+  font-weight: 900;
+  line-height: 0.85;
+  letter-spacing: 0;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.phase-name {
+  color: var(--ink);
+  font-size: 3rem;
+  font-weight: 850;
+  line-height: 1;
+  text-align: center;
+}
+
+.progress-track {
+  overflow: hidden;
+  height: 16px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg);
+}
+
+.progress-track span {
+  display: block;
+  width: 0;
+  height: 100%;
+  background: var(--accent);
+  transition: width 120ms linear;
+}
+
+.next-lines {
+  display: grid;
+  gap: var(--space-sm);
+  color: var(--muted);
+  font-size: 1.25rem;
+  text-align: center;
+}
+
+.runner-footer {
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.voice-status {
+  min-height: 1.2em;
+  color: var(--dim);
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+.template-panel {
+  align-self: start;
+  display: grid;
+  gap: var(--space-lg);
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  padding: var(--space-lg);
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+h1,
+h2 {
+  font-size: 1.3rem;
+  line-height: 1.1;
+}
+
+h3 {
+  font-size: 1rem;
+}
+
+.template-actions,
+.template-list,
+.interval-list {
+  display: grid;
+  gap: var(--space-md);
+}
+
+.primary-button,
+.secondary-button,
+.text-button,
+.icon-button,
+.action-button {
+  min-height: 42px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--ink);
+  background: var(--panel-strong);
+  font-weight: 800;
+}
+
+.primary-button {
+  color: oklch(16% 0.016 74);
+  background: var(--accent);
+  border-color: var(--accent);
+  padding: 0 var(--space-xl);
+}
+
+.secondary-button,
+.text-button {
+  padding: 0 var(--space-lg);
+}
+
+.text-button {
+  color: var(--muted);
+  background: transparent;
+}
+
+.compact {
+  min-height: 38px;
+  padding: 0 var(--space-lg);
+}
+
+.icon-button {
+  width: 42px;
+  padding: 0;
+  font-size: 1.1rem;
+}
+
+.action-button {
+  padding: 0 var(--space-sm);
+  font-size: 0.82rem;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.file-button {
+  display: grid;
+  place-items: center;
+}
+
+.file-button input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.workout-card {
+  display: grid;
+  gap: var(--space-sm);
+  width: 100%;
+  min-height: 88px;
+  padding: var(--space-md);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--ink);
+  background: var(--bg);
+  text-align: left;
+}
+
+.workout-card.is-active {
+  border-color: var(--accent);
+}
+
+.workout-card strong {
+  font-size: 1rem;
+}
+
+.workout-card span,
+.empty-state {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.saved-workout-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  gap: var(--space-sm);
+}
+
+.creator-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: grid;
+  place-items: center;
+  padding: var(--space-xl);
+  background: oklch(8% 0.01 92 / 0.72);
+}
+
+.creator-backdrop.is-hidden {
+  display: none;
+}
+
+.creator-panel {
+  display: grid;
+  gap: var(--space-xl);
+  width: min(900px, 100%);
+  max-height: calc(100vh - 40px);
+  overflow: auto;
+  padding: var(--space-xl);
+}
+
+.field,
+.name-field {
+  display: grid;
+  gap: var(--space-sm);
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.field input,
+.name-field input {
+  width: 100%;
+  min-height: 44px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--ink);
+  background: var(--bg);
+  padding: 0 var(--space-md);
+  font-weight: 750;
+  outline: none;
+}
+
+.field input:focus,
+.name-field input:focus,
+button:focus-visible,
+.file-button:focus-within {
+  border-color: var(--accent);
+  outline: 2px solid color-mix(in oklch, var(--accent), transparent 72%);
+  outline-offset: 2px;
+}
+
+.interval-card {
+  display: grid;
+  gap: var(--space-lg);
+  padding: var(--space-lg);
+}
+
+.interval-actions {
+  display: flex;
+  gap: var(--space-sm);
+}
+
+.interval-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(62px, 1fr));
+  gap: var(--space-md);
+}
+
+.compact-field {
+  gap: var(--space-xs);
+}
+
+.compact-field input {
+  min-height: 42px;
+  padding: 0 var(--space-sm);
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.compact-field small {
+  color: var(--dim);
+  font-size: 0.74rem;
+  text-align: center;
+  text-transform: lowercase;
+}
+
+.creator-actions {
+  position: sticky;
+  bottom: 0;
+  padding-top: var(--space-md);
+  background: var(--panel);
+}
+
+@media (max-width: 920px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .runner {
+    min-height: auto;
+  }
+
+  .template-panel {
+    max-height: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .app-shell {
+    width: min(100% - 20px, 1280px);
+    padding: var(--space-md) 0;
+  }
+
+  .runner-controls {
+    grid-template-columns: 64px 82px 64px;
+    gap: var(--space-md);
+  }
+
+  .round-button {
+    width: 64px;
+    height: 64px;
+    font-size: 1.8rem;
+  }
+
+  .play-button {
+    width: 82px;
+    height: 82px;
+    font-size: 1.75rem;
+  }
+
+  .timer-card {
+    min-height: 420px;
+    padding: var(--space-lg);
+  }
+
+  .time-readout {
+    font-size: 5.7rem;
+  }
+
+  .phase-name {
+    font-size: 1.9rem;
+  }
+
+  .next-lines {
+    font-size: 1rem;
+  }
+
+  .interval-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .saved-workout-row {
+    grid-template-columns: 1fr;
+  }
+
+  .repeat-field {
+    grid-column: 1 / -1;
+  }
+
+  .creator-backdrop {
+    padding: var(--space-sm);
+    place-items: stretch;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+  }
+}

@@ -38,10 +38,35 @@ PLANNING_PHASE_PLACEHOLDER = "<phase>"
 # Defaults for session.* values that are read once at controller start.
 DEFAULT_CLEAR_TO_MAJOR_DELAY = 1.5
 DEFAULT_MAX_IDENTICAL_MAJOR = 2
-DEFAULT_INPUT_BOX_SCAN_LINES = 5
+DEFAULT_INPUT_BOX_SCAN_LINES = 12
 DEFAULT_BUSY_MARKER_SCAN_LINES = 30
 DEFAULT_MENU_MAX_NAV_STEPS = 40
 DEFAULT_MENU_KEY_DELAY = 0.1
+
+# LLM fallback staircase: at most LLM_STAIRCASE_LEVELS API calls per static-
+# screen hash. Each level captures more pane lines and sends more context to
+# Haiku. Between calls, cache hits up to LLM_ESCALATION_POLLS times before
+# escalating. At ~5s/poll, 60 polls ≈ 5 minutes — long enough to be
+# meaningful, short enough to react to a stuck screen.
+LLM_STAIRCASE_LEVELS = [
+    {"capture": 250, "chars": 4000},
+    {"capture": 500, "chars": 8000},
+    {"capture": 1000, "chars": 16000},
+]
+LLM_ESCALATION_POLLS = 60
+
+# Transient HTTP status codes that warrant in-call retry rather than pausing
+# the controller. Anthropic's API returns 502/503/504 during brief outages
+# and 429 when we momentarily over-consume; both clear within seconds-minutes.
+LLM_TRANSIENT_HTTP_CODES = (408, 429, 500, 502, 503, 504)
+# In-call retry schedule (seconds between attempts). Total max blocking
+# time per call: ~17s. After exhaustion, controller enters cooldown.
+LLM_RETRY_BACKOFF = (2, 5, 10)
+# Cooldown after exhausted retries — every poll within this window short-
+# circuits to RUNNING ("treat as wait") without an API call. 2 min keeps the
+# duty cycle <10% during a long Anthropic outage while still recovering
+# quickly when service comes back.
+LLM_ERROR_COOLDOWN_SEC = 120
 
 
 def runtime_paths(repo: pathlib.Path) -> dict[str, pathlib.Path]:
@@ -145,6 +170,22 @@ def match_patterns(text: str, patterns: list[str], ignore_case: bool = True) -> 
     return out
 
 
+RATE_LIMIT_TAIL_LINES = 60
+
+
+def _flatten_tail(normalized: str, n_lines: int) -> str:
+    """Return the last n_lines of normalized output with all whitespace
+    (including newlines) collapsed to single spaces.
+
+    This makes pattern matching robust against terminal line-wrapping: a menu
+    option like "Stop and wait for limit to reset" that gets wrapped across
+    two rows in a narrow pane will still match. We confine to the live tail
+    so stale scrollback can't fire false positives forever after dismissal.
+    """
+    tail = "\n".join(normalized.split("\n")[-n_lines:]) if n_lines > 0 else normalized
+    return re.sub(r"\s+", " ", tail)
+
+
 def classify(
     normalized: str,
     hash_unstable: bool,
@@ -154,10 +195,52 @@ def classify(
 ) -> tuple[Classifier, dict]:
     info: dict = {"matched": []}
 
-    # 1. BUSY first. Active work takes precedence over everything — including
-    #    soft "approaching limit" warnings that may be visible inline while
-    #    Claude is still happily working. We only act on hard limits, never
-    #    warnings.
+    # 0. USAGE_LIMITED first — even before BUSY, in two flavors:
+    #
+    #    (a) Blocking rate-limit MENU. "Stop and wait for limit to reset" etc.
+    #        is unambiguous and does not appear in normal busy output. Above
+    #        BUSY/hash_unstable so lingering busy markers or cursor flicker
+    #        can't suppress detection.
+    #
+    #    (b) Inline SUBAGENT rate-limit text. When a subagent hits the cap,
+    #        Claude Code prints inline tool output (no menu):
+    #           ⎿  You've hit your limit · resets 1pm
+    #              /upgrade or /extra-usage to finish what you're working on.
+    #        Critically, Claude Code's UI may keep "1 local agent still
+    #        running" visible while the subagent dies — meaning busyMarkers
+    #        match at the same time as the inline text. Putting inline below
+    #        BUSY would mis-classify these dying-subagent transients as
+    #        active work and miss the limit. So inline lives above BUSY too;
+    #        the WAITING_FOR_RESET timer prevents re-firing thrash.
+    #
+    #    We match a whitespace-flattened tail so narrow-pane line-wrapping does
+    #    not break the regex, and we treat ANY one of the configured signature
+    #    patterns as sufficient (1-of-N) so wording drift on one option does
+    #    not require all options to match.
+    usage_opts = patterns.get("usageLimitMenuOptions", [])
+    if usage_opts:
+        flat_tail = _flatten_tail(normalized, RATE_LIMIT_TAIL_LINES)
+        usage_hits = match_patterns(flat_tail, usage_opts)
+        if usage_hits:
+            info["matched"] = usage_hits
+            info["hashUnstable"] = hash_unstable
+            info["source"] = "flattened-tail-menu"
+            return Classifier.USAGE_LIMITED, info
+
+    inline_markers = patterns.get("usageLimitInlineMarkers", [])
+    if inline_markers:
+        flat_tail = _flatten_tail(normalized, RATE_LIMIT_TAIL_LINES)
+        inline_hits = match_patterns(flat_tail, inline_markers)
+        if inline_hits:
+            info["matched"] = inline_hits
+            info["inline"] = True
+            info["hashUnstable"] = hash_unstable
+            info["source"] = "flattened-tail-inline"
+            return Classifier.USAGE_LIMITED, info
+
+    # 1. BUSY. Active work takes precedence over the remaining classifications —
+    #    including soft "approaching limit" warnings that may be visible inline
+    #    while Claude is still working.
     #    Scan only the live tail of the pane: active busy indicators
     #    ("esc to interrupt", spinner timer, "ctrl+b ctrl+b twice to background",
     #    "Waiting for completion notifications") are always rendered immediately
@@ -179,21 +262,6 @@ def classify(
     is_menu_up = (not has_box) or bool(menu_footer)
 
     if is_menu_up:
-        # 2a. USAGE_LIMITED requires the SPECIFIC rate-limit menu to be on
-        #     screen — i.e., all configured menu options must match. This is
-        #     deliberately strict so that inline "approaching weekly limit"
-        #     warnings, "5-hour limit · resets at" status text, etc. never
-        #     classify as a hit. Only the actual blocking menu does.
-        usage_opts = patterns.get("usageLimitMenuOptions", [])
-        if usage_opts:
-            usage_hits = [o for o in usage_opts
-                          if match_patterns(normalized, [o])]
-            if len(usage_hits) == len(usage_opts):
-                info["matched"] = usage_hits
-                info["menuFooter"] = menu_footer
-                return Classifier.USAGE_LIMITED, info
-
-        # 2b. Generic menu (handled by _handle_menu rules elsewhere).
         info["matched"] = menu_footer
         return Classifier.MENU, info
 
@@ -411,6 +479,32 @@ class Controller:
         # Per-run signals for liveness logging
         self.last_classifier: str | None = None
         self.last_heartbeat_at: float = 0.0
+        self.last_near_miss_warn_at: float = 0.0
+
+        # LLM fallback cache + staircase.
+        #
+        # The fallback fires on every IDLE-stable poll when no deterministic
+        # rule matches. On a long static screen that's one API call per poll
+        # (5s) — real money. Two-layer protection:
+        #
+        # (1) Hash cache: once Haiku says "wait" on a given screen hash,
+        #     subsequent polls reuse the decision until something on screen
+        #     changes (or escalation kicks in).
+        #
+        # (2) Staircase: per static-screen hash, allow up to N API calls
+        #     total. After ESCALATION_POLLS cache hits, invalidate cache and
+        #     re-call Haiku with MORE pane context (deeper scrollback +
+        #     longer prompt window) — it might catch something it missed at
+        #     the smaller window. After the cap is exhausted, stay in cached
+        #     wait permanently to prevent runaway cost.
+        self.llm_cache_hash: str | None = None
+        self.llm_cache_was_wait: bool = False
+        self.llm_cache_at: float = 0.0
+        self.llm_cache_hits: int = 0
+        self.llm_static_hash: str | None = None
+        self.llm_static_calls: int = 0
+        # Transient-error cooldown: skip API calls until this timestamp.
+        self.llm_error_cooldown_until: float = 0.0
 
     def _log_level(self) -> int:
         return {
@@ -486,6 +580,28 @@ class Controller:
             f"config={self.repo / CONFIG_REL} logLevel={self.config['session'].get('logLevel','info')}"
         )
 
+        # If the persisted state.json says the previous run ended in a terminal
+        # state (COMPLETE or ERROR), treat this fresh `run` as a new workflow
+        # rather than exiting immediately. Without this, completing a milestone
+        # leaves state.json in COMPLETE forever and every subsequent `run`
+        # silently no-ops the moment the main loop's while-condition is checked.
+        if self.state.state in (State.COMPLETE.value, State.ERROR.value):
+            prev = self.state.state
+            self.state = RuntimeState()
+            self._save_state()
+            self.logger.info(f"previous run ended in {prev}; resetting state to BOOT")
+
+        # If the previous run got stuck in PAUSED_FOR_HUMAN, restarting the
+        # controller is an implicit "I'm back, retry". Without this, the only
+        # way out of PAUSED_FOR_HUMAN is a BUSY classifier blip, which never
+        # arrives if Claude itself is sitting idle — leading to overnight
+        # strandings exactly like the inputBoxScanLines=5 false-menu bug.
+        # We keep all other state (lastPhase, retryCounts, etc.) intact.
+        if self.state.state == State.PAUSED_FOR_HUMAN.value:
+            self.state.state = State.RUNNING.value
+            self._save_state()
+            self.logger.info("previous run was PAUSED_FOR_HUMAN; resuming on restart")
+
         if self.state.state == State.BOOT.value:
             self._transition(State.SESSION_STARTING, reason="boot")
         if self.state.state == State.SESSION_STARTING.value:
@@ -558,10 +674,29 @@ class Controller:
                 )
                 self.last_classifier = classifier.value
 
+            now_ts = time.time()
+
+            # Rate-limit near-miss diagnostic: rate-limit menu text appears in
+            # the live tail but classifier did NOT fire USAGE_LIMITED. This is
+            # the exact failure mode that strands the controller overnight —
+            # the menu is up but we don't act on it. Log loudly so post-hoc
+            # log review can confirm the cause. Throttled to once per 60s to
+            # avoid flooding when stale text lingers in scrollback.
+            if classifier != Classifier.USAGE_LIMITED:
+                tail_for_warn = "\n".join(normalized.split("\n")[-RATE_LIMIT_TAIL_LINES:])
+                if re.search(r"stop and wait|limit to reset|usage limit reached",
+                             tail_for_warn, re.IGNORECASE):
+                    if now_ts - self.last_near_miss_warn_at >= 60:
+                        self.last_near_miss_warn_at = now_ts
+                        snippet = re.sub(r"\s+", " ", tail_for_warn)[-300:]
+                        self.logger.warning(
+                            f"rate-limit near-miss: classifier={classifier.value} "
+                            f"info={info} tail_snippet={snippet!r}"
+                        )
+
             # Heartbeat: emit a status summary every heartbeat_interval seconds even
             # if nothing changed. Without this, the log can go silent for hours
             # during busy phases and you can't tell if the controller is alive.
-            now_ts = time.time()
             if now_ts - self.last_heartbeat_at >= self.heartbeat_interval:
                 last_action = self.state.lastActionTimestamp
                 if last_action:
@@ -622,7 +757,7 @@ class Controller:
 
         if classifier == Classifier.USAGE_LIMITED:
             self._transition(State.USAGE_LIMITED, reason=f"usage limit detected ({info.get('matched')})")
-            self._handle_usage_limited(normalized)
+            self._handle_usage_limited(normalized, info)
             return
 
         if classifier == Classifier.MENU:
@@ -845,29 +980,46 @@ class Controller:
         self.logger.warning("text prompt: no rule matched; pausing")
         self._transition(State.PAUSED_FOR_HUMAN, reason="unrecognized text prompt")
 
-    def _handle_usage_limited(self, normalized: str) -> None:
+    def _handle_usage_limited(self, normalized: str, info: dict) -> None:
         max_attempts = int(self.config["policy"].get("maxUsageResetAttempts", 32))
         if self.state.usageResetAttempts >= max_attempts:
             self.logger.error(f"max usage reset attempts ({max_attempts}) exhausted; pausing")
             self._transition(State.PAUSED_FOR_HUMAN, reason="usage reset attempts exhausted")
             return
 
-        # The Claude Code rate-limit menu always presents "Stop and wait for
-        # limit to reset" as option 1 with the cursor pre-selected on it.
-        # Just press Enter — no cursor detection or arrow-key navigation
-        # needed. This avoids an entire class of menu-navigation bugs that
-        # otherwise show up when the input prompt's ❯ confuses cursor scans.
-        # If Claude Code ever changes the default option order, the worst
-        # case is we accidentally select Upgrade once and the user notices
-        # — far better than the convoluted scan-and-jump logic.
-        self.logger.info("usage-limit menu detected; pressing Enter on default option")
-        try:
-            self.tmux.send_keys("Enter")
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            self.logger.error(f"usage-limit Enter send-keys failed: {e}")
-            self._transition(State.PAUSED_FOR_HUMAN, reason=f"send-keys failed: {e}")
-            return
-        self._emit_action(kind="key", text="Enter")
+        if info.get("inline"):
+            # Inline subagent rate-limit: no menu to dismiss; the input box is
+            # live and Claude is awaiting input. Send "continue" to nudge it,
+            # then enter the same WAITING_FOR_RESET 15-min retry loop the menu
+            # path uses.
+            cont = self.config["commands"].get("continue", "continue")
+            self.logger.info(f"inline usage-limit detected; sending '{cont}'")
+            try:
+                self._send_text(cont)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                self.logger.error(f"inline usage-limit send-text failed: {e}")
+                self._transition(State.PAUSED_FOR_HUMAN, reason=f"send-text failed: {e}")
+                return
+            transition_reason = "inline usage-limit; sent continue"
+        else:
+            # The Claude Code rate-limit menu always presents "Stop and wait
+            # for limit to reset" as option 1 with the cursor pre-selected on
+            # it. Just press Enter — no cursor detection or arrow-key
+            # navigation needed. This avoids an entire class of menu-
+            # navigation bugs that otherwise show up when the input prompt's
+            # ❯ confuses cursor scans. If Claude Code ever changes the default
+            # option order, the worst case is we accidentally select Upgrade
+            # once and the user notices — far better than the convoluted
+            # scan-and-jump logic.
+            self.logger.info("usage-limit menu detected; pressing Enter on default option")
+            try:
+                self.tmux.send_keys("Enter")
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                self.logger.error(f"usage-limit Enter send-keys failed: {e}")
+                self._transition(State.PAUSED_FOR_HUMAN, reason=f"send-keys failed: {e}")
+                return
+            self._emit_action(kind="key", text="Enter")
+            transition_reason = "rate-limit menu Enter on default"
 
         wait_min = self.config["policy"].get("usageResetWaitMinutes", 15)
         self.state.usageResetAttempts += 1
@@ -875,10 +1027,10 @@ class Controller:
             dt.datetime.now() + dt.timedelta(minutes=wait_min)
         ).isoformat()
         self.logger.info(
-            f"usage limited; selected default (Stop and wait); waiting until "
+            f"usage limited (inline={bool(info.get('inline'))}); waiting until "
             f"{self.state.waitingResetUntil} (attempt {self.state.usageResetAttempts}/{max_attempts})"
         )
-        self._transition(State.WAITING_FOR_RESET, reason="rate-limit menu Enter on default")
+        self._transition(State.WAITING_FOR_RESET, reason=transition_reason)
 
     def _handle_waiting_for_reset(self, classifier: Classifier, normalized: str) -> None:
         if self.state.waitingResetUntil:
@@ -914,17 +1066,95 @@ class Controller:
         self._transition(State.RUNNING, reason="usage block cleared")
 
     def _try_llm_fallback(self, normalized: str) -> None:
+        # Cooldown after recent transient errors (502/503/timeout, etc.) —
+        # treat every poll within the cooldown window as "wait" without
+        # calling the API. Avoids hammering Anthropic during an outage and
+        # avoids stranding the controller in PAUSED_FOR_HUMAN over a blip.
+        now_ts = time.time()
+        if now_ts < self.llm_error_cooldown_until:
+            remain = int(self.llm_error_cooldown_until - now_ts)
+            self.logger.debug(f"LLM fallback in cooldown ({remain}s left); treating as wait")
+            self._transition(State.RUNNING, reason=f"LLM error cooldown {remain}s — wait")
+            return
+
+        cur_hash = screen_hash(normalized)
+
+        # New screen → reset staircase + cache.
+        if cur_hash != self.llm_static_hash:
+            self.llm_static_hash = cur_hash
+            self.llm_static_calls = 0
+            self.llm_cache_hash = None
+            self.llm_cache_was_wait = False
+            self.llm_cache_hits = 0
+
+        # Cache short-circuit. After ESCALATION_POLLS cache hits on the same
+        # screen, fall through to a fresh API call with deeper context — gives
+        # Haiku another shot at catching something it missed (e.g., a rate-
+        # limit menu hidden in scrollback above the small initial window).
+        if self.llm_cache_hash == cur_hash and self.llm_cache_was_wait:
+            self.llm_cache_hits += 1
+            if self.llm_cache_hits < LLM_ESCALATION_POLLS:
+                age = time.time() - self.llm_cache_at
+                self.logger.debug(
+                    f"LLM fallback: cached wait (hash={cur_hash}, hits={self.llm_cache_hits}, age={age:.0f}s)"
+                )
+                self._transition(State.RUNNING, reason="cached LLM wait — same screen")
+                return
+            # Escalation tick — drop cache, fall through to fresh call.
+            self.llm_cache_hash = None
+            self.llm_cache_was_wait = False
+            self.llm_cache_hits = 0
+            self.logger.info(
+                f"LLM fallback: escalating after {LLM_ESCALATION_POLLS} cache hits "
+                f"(hash={cur_hash}, level={self.llm_static_calls + 1})"
+            )
+
+        # Staircase cap. After LLM_STAIRCASE_LEVELS attempts on a static
+        # screen, stay in cached-wait sticky mode rather than burning more
+        # API calls. Better to under-react than to bleed money on a screen
+        # neither rules nor LLM can resolve.
+        if self.llm_static_calls >= len(LLM_STAIRCASE_LEVELS):
+            if self.llm_cache_hash != cur_hash or not self.llm_cache_was_wait:
+                self.logger.info(
+                    f"LLM staircase cap ({len(LLM_STAIRCASE_LEVELS)}) reached on hash {cur_hash}; "
+                    f"sticky wait (no further calls until screen changes)"
+                )
+            self.llm_cache_hash = cur_hash
+            self.llm_cache_was_wait = True
+            self.llm_cache_at = time.time()
+            # Reset hit counter so the cache short-circuit holds for another
+            # ESCALATION_POLLS polls. After that window, the escalation tick
+            # will drop the cache, the cap check above will catch it again,
+            # and we re-enter sticky wait — at most one INFO log every 5 min.
+            self.llm_cache_hits = 0
+            self._transition(State.RUNNING, reason="LLM staircase cap — sticky wait")
+            return
+
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             self.logger.warning("LLM fallback enabled but ANTHROPIC_API_KEY not set; pausing")
             self._transition(State.PAUSED_FOR_HUMAN, reason="LLM fallback unavailable")
             return
 
+        # Capture pane fresh at this level's depth — earlier scrollback may
+        # contain context that changes Haiku's verdict (e.g., a rate-limit
+        # menu rendered before status footer).
+        level_idx = self.llm_static_calls
+        level = LLM_STAIRCASE_LEVELS[level_idx]
+        try:
+            raw = self.tmux.capture_pane(level["capture"])
+            staircase_normalized = normalize_screen(raw)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            self.logger.error(f"LLM fallback pane capture failed: {e}; using polled screen")
+            staircase_normalized = normalized
+        screen_for_llm = staircase_normalized[-level["chars"]:]
+        self.llm_static_calls += 1
+
         whitelist = self.config["policy"].get("llmFallbackAllowedTexts", [])
         snapshot_id = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
         snapshot_path = self.paths["screens"] / f"{snapshot_id}.txt"
         try:
-            snapshot_path.write_text(normalized)
+            snapshot_path.write_text(staircase_normalized)
         except OSError:
             pass
 
@@ -932,8 +1162,10 @@ class Controller:
             "You are a CLI orchestration assistant inspecting one terminal screen.\n"
             "Decide ONE next action.\n\n"
             "Output ONLY a JSON object of the form:\n"
-            '{"decision": "send_text" | "wait" | "pause_for_human", '
+            '{"decision": "send_text" | "wait" | "pause_for_human" | '
+            '"usage_limit_menu" | "usage_limit_inline" | "plan" | "execute", '
             '"text": "<required only when decision=send_text; otherwise null>", '
+            '"phase": <integer, required only when decision=plan or decision=execute>, '
             '"reason": "<<=200 chars>", "confidence": "high" | "low"}\n\n'
             "Decision semantics:\n"
             "- send_text: respond with a specific allowed text now.\n"
@@ -941,15 +1173,52 @@ class Controller:
             "(subagents running, async task in progress, parallel worktrees, etc.). "
             "Controller will keep observing — DO NOT use this for human-intervention scenarios.\n"
             "- pause_for_human: a human must intervene (unrecognized prompt, error, "
-            "decision genuinely requiring judgment). Controller halts injection.\n\n"
+            "decision genuinely requiring judgment). Controller halts injection.\n"
+            "- plan: dispatch a plan-phase major command for the given phase number. "
+            "Controller renders the configured plan command and sends /clear + cmd. "
+            "Use ONLY when Claude has clearly signalled the previous phase is complete "
+            "AND the next phase needs planning (e.g., a 'phase X complete; next phase Y' "
+            "summary, or roadmap status showing phase Y next without an existing plan).\n"
+            "- execute: dispatch an execute-phase major command for the given phase. "
+            "Use ONLY when planning is clearly complete and execution is the next step.\n"
+            "- usage_limit_menu: Claude Code is showing the BLOCKING rate-limit menu — "
+            "i.e., 'Stop and wait for limit to reset' AND 'Upgrade your plan' visible "
+            "as SELECTABLE menu options with cursor (❯ / ▸) on one of them. "
+            "Controller presses Enter on default and enters wait/retry loop.\n"
+            "- usage_limit_inline: a SUBAGENT hit a HARD usage limit. ONLY fire when "
+            "the literal phrase 'hit your limit' appears as inline tool output (a ⎿ "
+            "marker block from a completed subagent), e.g.:\n"
+            "    ⎿  You've hit your limit · resets 1pm\n"
+            "       /upgrade or /extra-usage to finish what you're working on.\n"
+            "  This is a HARD-FAILURE rendering — distinct shape from soft warnings.\n"
+            "  ❌ DO NOT fire usage_limit_inline for any of these (they are SOFT, "
+            "informational, and the controller must NOT send 'continue'):\n"
+            "    • 'You've used X% of your session limit ...'\n"
+            "    • 'X% used' / 'XX% of weekly limit' / progress-bar text\n"
+            "    • '5-hour limit · resets at HH:MM'\n"
+            "    • Any percentage-based warning, status footer, or approaching-limit hint\n"
+            "  If you are uncertain whether it's a real hit vs a percentage warning, "
+            "return 'wait' — never speculate.\n\n"
+            "CRITICAL — INPUT-BOX HYGIENE:\n"
+            "The input box may contain STAGED text the user or Claude typed but did "
+            "NOT submit (e.g., '❯ /gsd-plan-phase 91' sitting unsent). Treat this as "
+            "noise, NOT evidence. NEVER:\n"
+            "  • dispatch 'plan'/'execute' just because a /gsd-X-phase command is "
+            "    staged in the input box;\n"
+            "  • return send_text just to 'submit' staged input.\n"
+            "Only dispatch plan/execute when Claude's printed OUTPUT clearly states the "
+            "phase has completed and which phase is next.\n\n"
             f"Allowed text values for send_text (case-insensitive exact match): {json.dumps(whitelist)}\n"
-            "You MAY NOT issue slash commands. You MAY NOT navigate menus.\n"
+            "You MAY NOT issue slash commands directly via send_text. You MAY NOT "
+            "navigate menus.\n"
             "If the safe action is not unambiguous AND no autonomous resolution is in progress, "
             "return decision=pause_for_human.\n\n"
             f"Controller state: {self.state.state}\n"
             f"Last command sent: {self.state.lastCommandSent!r}\n"
-            f"Last phase: {self.state.lastPhase!r}\n\n"
-            f"Screen (last 4000 chars):\n{normalized[-4000:]}\n"
+            f"Last phase: {self.state.lastPhase!r}\n"
+            f"Staircase level: {level_idx + 1}/{len(LLM_STAIRCASE_LEVELS)} "
+            f"(capture={level['capture']} lines, context={level['chars']} chars)\n\n"
+            f"Screen (last {level['chars']} chars):\n{screen_for_llm}\n"
         )
 
         body = {
@@ -966,13 +1235,81 @@ class Controller:
                 "content-type": "application/json",
             },
         )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                resp_data = json.loads(resp.read())
-            text = "".join(p.get("text", "") for p in resp_data.get("content", []))
-        except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as e:
-            self.logger.error(f"LLM fallback request failed: {e}; pausing")
-            self._transition(State.PAUSED_FOR_HUMAN, reason="LLM fallback error")
+        # Retry loop: up to len(LLM_RETRY_BACKOFF)+1 attempts. Transient HTTP
+        # codes (502/503/504/408/429/500) and network errors retry with the
+        # configured backoff schedule. Non-transient errors (auth, malformed
+        # request) pause for human. After retries exhausted, enter cooldown
+        # (treat subsequent polls as "wait") rather than pause — the API will
+        # likely recover within minutes and we don't want to strand overnight.
+        text: str | None = None
+        max_attempts = len(LLM_RETRY_BACKOFF) + 1
+        for attempt in range(max_attempts):
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    resp_data = json.loads(resp.read())
+                text = "".join(p.get("text", "") for p in resp_data.get("content", []))
+                break
+            except urllib.error.HTTPError as e:
+                transient = e.code in LLM_TRANSIENT_HTTP_CODES
+                if transient and attempt < len(LLM_RETRY_BACKOFF):
+                    backoff = LLM_RETRY_BACKOFF[attempt]
+                    self.logger.warning(
+                        f"LLM fallback HTTP {e.code} {e.reason} "
+                        f"(attempt {attempt + 1}/{max_attempts}); retrying in {backoff}s"
+                    )
+                    time.sleep(backoff)
+                    continue
+                # Either non-transient, or retries exhausted.
+                if transient:
+                    self.logger.error(
+                        f"LLM fallback exhausted retries on HTTP {e.code} ({e.reason}); "
+                        f"entering {LLM_ERROR_COOLDOWN_SEC}s cooldown"
+                    )
+                    self.llm_error_cooldown_until = time.time() + LLM_ERROR_COOLDOWN_SEC
+                    self._transition(
+                        State.RUNNING,
+                        reason=f"LLM transient HTTP {e.code} after retries — wait",
+                    )
+                else:
+                    self.logger.error(
+                        f"LLM fallback non-transient HTTP {e.code} ({e.reason}); pausing"
+                    )
+                    self._transition(
+                        State.PAUSED_FOR_HUMAN,
+                        reason=f"LLM fallback HTTP {e.code}",
+                    )
+                return
+            except (urllib.error.URLError, OSError) as e:
+                # Network/timeout/socket error — always treat as transient.
+                if attempt < len(LLM_RETRY_BACKOFF):
+                    backoff = LLM_RETRY_BACKOFF[attempt]
+                    self.logger.warning(
+                        f"LLM fallback network error (attempt {attempt + 1}/{max_attempts}): {e}; "
+                        f"retrying in {backoff}s"
+                    )
+                    time.sleep(backoff)
+                    continue
+                self.logger.error(
+                    f"LLM fallback network error after {max_attempts} attempts: {e}; "
+                    f"entering {LLM_ERROR_COOLDOWN_SEC}s cooldown"
+                )
+                self.llm_error_cooldown_until = time.time() + LLM_ERROR_COOLDOWN_SEC
+                self._transition(
+                    State.RUNNING,
+                    reason="LLM network error after retries — wait",
+                )
+                return
+            except ValueError as e:
+                # JSON decode error — API gave us garbage. Not retry-worthy.
+                self.logger.error(f"LLM fallback bad JSON response: {e}; pausing")
+                self._transition(State.PAUSED_FOR_HUMAN, reason="LLM fallback bad JSON")
+                return
+
+        if text is None:
+            # Defensive — should be unreachable, every loop branch either sets
+            # text, returns, or continues.
+            self.logger.error("LLM fallback retry loop produced no response; pausing")
+            self._transition(State.PAUSED_FOR_HUMAN, reason="LLM fallback empty response")
             return
 
         self.logger.info(f"LLM fallback raw response: {text!r}")
@@ -986,19 +1323,31 @@ class Controller:
             self._transition(State.PAUSED_FOR_HUMAN, reason="LLM non-JSON response")
             return
 
-        # Schema: decision is required and one of three known values.
-        # text is REQUIRED only for send_text — for wait/pause_for_human it
-        # may be null/empty (LLM has nothing to send and the controller does
-        # nothing or pauses, in either case no text is consumed).
+        # Schema: decision is required and one of the known values.
+        # - text is REQUIRED only for send_text.
+        # - phase is REQUIRED (positive int) only for plan/execute.
+        # Other decisions ignore both fields.
         decision = decision_obj.get("decision") if isinstance(decision_obj, dict) else None
+        valid_decisions = (
+            "send_text", "wait", "pause_for_human",
+            "usage_limit_menu", "usage_limit_inline",
+            "plan", "execute",
+        )
         valid = (
             isinstance(decision_obj, dict)
-            and decision in ("send_text", "wait", "pause_for_human")
+            and decision in valid_decisions
             and isinstance(decision_obj.get("reason", ""), str)
         )
         if valid and decision == "send_text":
             t = decision_obj.get("text")
             valid = isinstance(t, str) and bool(t.strip())
+        phase_int: int | None = None
+        if valid and decision in ("plan", "execute"):
+            p = decision_obj.get("phase")
+            if isinstance(p, bool) or not isinstance(p, (int, float)) or p <= 0:
+                valid = False
+            else:
+                phase_int = int(p)
         if not valid:
             self.logger.warning(f"LLM fallback failed schema validation: {decision_obj}")
             self._transition(State.PAUSED_FOR_HUMAN, reason="LLM schema invalid")
@@ -1009,6 +1358,7 @@ class Controller:
                 "snapshot": str(snapshot_path),
                 "raw": text[:500],
                 "parsed": decision_obj,
+                "level": level_idx + 1,
             }
         )
 
@@ -1020,6 +1370,12 @@ class Controller:
                 f"LLM advised wait: {decision_obj.get('reason')} "
                 f"(confidence={decision_obj.get('confidence')})"
             )
+            # Cache this decision so subsequent polls on the same screen skip
+            # the API call entirely until ESCALATION_POLLS hits or hash change.
+            self.llm_cache_hash = cur_hash
+            self.llm_cache_was_wait = True
+            self.llm_cache_at = time.time()
+            self.llm_cache_hits = 0
             self._transition(State.RUNNING, reason="LLM wait — autonomous resolution")
             return
 
@@ -1027,6 +1383,59 @@ class Controller:
             self.logger.info(f"LLM advised pause: {decision_obj.get('reason')}")
             self._transition(State.PAUSED_FOR_HUMAN, reason="LLM pause_for_human")
             return
+
+        if decision in ("usage_limit_menu", "usage_limit_inline"):
+            inline = (decision == "usage_limit_inline")
+            self.logger.info(
+                f"LLM advised {decision}: {decision_obj.get('reason')} "
+                f"(confidence={decision_obj.get('confidence')})"
+            )
+            # Reset cache + staircase: handing off to the USAGE_LIMITED flow,
+            # which manages its own retry timer. We don't want stale cache
+            # affecting future fallback calls if the limit clears.
+            self.llm_cache_hash = None
+            self.llm_cache_was_wait = False
+            self.llm_static_calls = 0
+            self._transition(
+                State.USAGE_LIMITED,
+                reason=f"LLM detected rate-limit ({'inline' if inline else 'menu'})",
+            )
+            self._handle_usage_limited(staircase_normalized, {"inline": inline})
+            return
+
+        if decision in ("plan", "execute"):
+            # LLM-recommended major command. Same dispatch path the
+            # deterministic rules use — _send_major_command handles /clear,
+            # template rendering, dedup-guard, and state bookkeeping.
+            phase_str = str(phase_int)
+            self.logger.info(
+                f"LLM dispatched {decision} phase {phase_str}: "
+                f"{decision_obj.get('reason')} "
+                f"(confidence={decision_obj.get('confidence')})"
+            )
+            self.state.lastPhase = phase_str
+            # Clear cache + staircase since we're acting; screen will change.
+            self.llm_cache_hash = None
+            self.llm_cache_was_wait = False
+            self.llm_static_calls = 0
+            if decision == "plan":
+                mode = self.config["policy"].get("defaultPlanMode", "without_research")
+                tmpl_key = "withResearch" if mode == "with_research" else "withoutResearch"
+                tmpl = self.config["commands"]["plan"][tmpl_key]
+                prd = self.config["project"].get("prdPath", "")
+                skip_verify = bool(self.config["policy"].get("skipPlanVerification", False))
+                verify_flag = "--skip-verify" if skip_verify else ""
+                self._send_major_command(tmpl, phase=phase_str, prd=prd, verify_flag=verify_flag)
+            else:
+                tmpl = self.config["commands"]["execute"]["default"]
+                self._send_major_command(tmpl, phase=phase_str)
+            self._transition(State.RUNNING, reason=f"LLM dispatched {decision} phase {phase_str}")
+            return
+
+        # Non-wait decisions (send_text below) imply we acted; the screen
+        # should change next poll. Invalidate cache so we re-evaluate fresh.
+        self.llm_cache_hash = None
+        self.llm_cache_was_wait = False
 
         proposed = decision_obj.get("text", "")
         canonical = next((w for w in whitelist if proposed.lower() == w.lower()), None)
@@ -1428,11 +1837,7 @@ def cmd_stop_next(_args) -> None:
     print("The controller will transition to COMPLETE before injecting another major command.")
 
 
-def cmd_kill(_args) -> None:
-    repo = pathlib.Path.cwd()
-    paths = runtime_paths(repo)
-
-    killed_controller = False
+def kill_controller_process(paths: dict[str, pathlib.Path]) -> bool:
     if paths["pid"].exists():
         try:
             pid = int(paths["pid"].read_text().strip())
@@ -1456,12 +1861,42 @@ def cmd_kill(_args) -> None:
             killed_controller = True
         else:
             print(f"[gsd-auto-v4] no live controller for PID file (stale)")
+            killed_controller = False
         try:
             paths["pid"].unlink()
         except FileNotFoundError:
             pass
     else:
         print("[gsd-auto-v4] no controller PID file")
+        killed_controller = False
+    return killed_controller
+
+
+def cmd_kill_controller(_args) -> None:
+    paths = runtime_paths(pathlib.Path.cwd())
+    if not kill_controller_process(paths):
+        print("[gsd-auto-v4] no controller process killed")
+
+
+def cmd_restart(args) -> None:
+    """Hot-restart the controller while keeping tmux + Claude alive.
+
+    Use this after editing the script or config: kills only the controller
+    process, then re-runs cmd_run which detects the existing tmux session,
+    skips Claude relaunch, and spawns a new controller loop. Claude's chat
+    context is preserved.
+    """
+    paths = runtime_paths(pathlib.Path.cwd())
+    if kill_controller_process(paths):
+        time.sleep(1)
+    cmd_run(args)
+
+
+def cmd_kill(_args) -> None:
+    repo = pathlib.Path.cwd()
+    paths = runtime_paths(repo)
+
+    killed_controller = kill_controller_process(paths)
 
     killed_session = False
     try:
@@ -1590,7 +2025,9 @@ def main() -> None:
     sub.add_parser("pause", help="Pause action injection")
     sub.add_parser("resume", help="Resume action injection")
     sub.add_parser("stop-next", help="Allow current task to finish, then COMPLETE")
+    sub.add_parser("kill-controller", help="Hard-kill controller process only")
     sub.add_parser("kill", help="Hard-kill controller process and tmux session")
+    sub.add_parser("restart", help="Hot-restart controller, keep tmux session alive")
 
     pt = sub.add_parser("tail", help="Tail controller log")
     pt.add_argument("-f", "--follow", action="store_true", help="Follow new log lines")
@@ -1608,7 +2045,9 @@ def main() -> None:
         "pause": cmd_pause,
         "resume": cmd_resume,
         "stop-next": cmd_stop_next,
+        "kill-controller": cmd_kill_controller,
         "kill": cmd_kill,
+        "restart": cmd_restart,
         "tail": cmd_tail,
         "doctor": cmd_doctor,
         "_loop": cmd_loop,

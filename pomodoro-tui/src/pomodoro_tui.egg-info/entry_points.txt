@@ -1,0 +1,3 @@
+[console_scripts]
+pomodoro-tui = pomodoro_tui.cli:main
+pomopp = pomodoro_tui.cli:main

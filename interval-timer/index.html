@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Interval Timer</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="runner" aria-label="Timer runner">
+        <div class="runner-controls" aria-label="Step controls">
+          <button class="round-button" type="button" id="previous-step" aria-label="Previous step">&larr;</button>
+          <button class="round-button play-button" type="button" id="play-pause" aria-label="Start timer">&#9654;</button>
+          <button class="round-button" type="button" id="next-step" aria-label="Next step">&rarr;</button>
+        </div>
+
+        <div class="timer-card" aria-live="polite">
+          <div class="phase-meta">
+            <span id="phase-kind">Ready</span>
+            <span id="phase-position">0 / 0</span>
+          </div>
+          <div class="time-readout" id="time-readout">00:00</div>
+          <div class="phase-name" id="phase-name">No template selected</div>
+          <div class="progress-track" aria-hidden="true">
+            <span id="phase-progress"></span>
+          </div>
+          <div class="next-lines">
+            <div id="up-next">Next: -</div>
+            <div id="upcoming">Upcoming: -</div>
+          </div>
+        </div>
+
+        <div class="runner-footer">
+          <button class="text-button" type="button" id="reset">Reset</button>
+          <button class="text-button" type="button" id="sound-toggle" aria-pressed="true">Sound on</button>
+          <button class="text-button" type="button" id="voice-toggle" aria-pressed="true">Voice on</button>
+        </div>
+        <div class="voice-status" id="voice-status" aria-live="polite"></div>
+      </section>
+
+      <section class="template-panel" aria-label="Templates">
+        <div class="panel-header">
+          <h1>Templates</h1>
+          <button class="primary-button compact" type="button" id="new-workout">New</button>
+        </div>
+
+        <div class="template-actions">
+          <label class="secondary-button compact file-button">
+            Import CSV
+            <input id="csv-input" type="file" accept=".csv,text/csv" />
+          </label>
+        </div>
+
+        <div class="template-list" id="saved-list"></div>
+      </section>
+    </main>
+
+    <section class="creator-backdrop is-hidden" id="creator-backdrop" aria-hidden="true">
+      <div class="creator-panel" role="dialog" aria-modal="true" aria-labelledby="creator-title">
+        <div class="panel-header">
+          <h2 id="creator-title">New template</h2>
+          <button class="icon-button" type="button" id="close-creator" aria-label="Close creator">&times;</button>
+        </div>
+
+        <label class="field">
+          <span>Name</span>
+          <input id="workflow-name" type="text" value="New template" maxlength="48" />
+        </label>
+
+        <div class="section-heading">
+          <h3>Steps</h3>
+          <button class="secondary-button compact" type="button" id="add-interval">Add step</button>
+        </div>
+
+        <div class="interval-list" id="interval-list"></div>
+
+        <div class="save-row creator-actions">
+          <button class="primary-button" type="button" id="save-workflow">Save</button>
+          <button class="secondary-button" type="button" id="discard-workflow">Cancel</button>
+        </div>
+      </div>
+    </section>
+
+    <template id="interval-template">
+      <article class="interval-card">
+        <div class="interval-topline">
+          <label class="name-field">
+            <span>Step</span>
+            <input class="interval-name" type="text" maxlength="36" />
+          </label>
+          <div class="interval-actions">
+            <button class="icon-button move-up" type="button" aria-label="Move step up">&uarr;</button>
+            <button class="icon-button move-down" type="button" aria-label="Move step down">&darr;</button>
+            <button class="icon-button remove-interval" type="button" aria-label="Remove step">&times;</button>
+          </div>
+        </div>
+
+        <div class="interval-grid">
+          <label class="field compact-field">
+            <span>Work</span>
+            <input class="work-minutes" type="number" min="0" max="99" inputmode="numeric" />
+            <small>min</small>
+          </label>
+          <label class="field compact-field">
+            <span>&nbsp;</span>
+            <input class="work-seconds" type="number" min="0" max="59" inputmode="numeric" />
+            <small>sec</small>
+          </label>
+          <label class="field compact-field">
+            <span>Rest</span>
+            <input class="rest-minutes" type="number" min="0" max="99" inputmode="numeric" />
+            <small>min</small>
+          </label>
+          <label class="field compact-field">
+            <span>&nbsp;</span>
+            <input class="rest-seconds" type="number" min="0" max="59" inputmode="numeric" />
+            <small>sec</small>
+          </label>
+          <label class="field compact-field repeat-field">
+            <span>Repeat</span>
+            <input class="repeat-count" type="number" min="1" max="99" inputmode="numeric" />
+            <small>times</small>
+          </label>
+        </div>
+      </article>
+    </template>
+
+    <script src="app.js"></script>
+  </body>
+</html>

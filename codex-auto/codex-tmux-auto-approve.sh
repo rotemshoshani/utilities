@@ -62,7 +62,7 @@ DEFAULT_BLACKLIST_PATTERNS=(
   '(^|[[:space:];|&])gpg([[:space:]]|$)'
   '(^|[[:space:];|&])age([[:space:]]|$)'
   '(^|[[:space:];|&])security([[:space:]]|$)'
-  '(^|[[:space:];|&])pass([[:space:]]|$)'
+  '(^|[[:space:];|&])pass[[:space:]]+'
   '(^|[[:space:];|&])cat[[:space:]]+~/(.ssh|.aws|.config)([[:space:]/]|$)'
   '(^|[[:space:];|&])printenv([[:space:]]|$)'
   '(^|[[:space:];|&])env([[:space:]]|$)'
@@ -162,7 +162,8 @@ load_blacklist_patterns() {
 
 extract_prompt_command() {
   awk '
-    /^\$/ {
+    index($0, "$ ") {
+      sub(/^.*\$[[:space:]]*/, "")
       sub(/^\$[[:space:]]*/, "")
       print
       found = 1
@@ -180,7 +181,7 @@ extract_prompt_command() {
     found {
       exit
     }
-  '
+  ' | sed '/^[[:space:]]*$/d'
 }
 
 blacklist_match() {

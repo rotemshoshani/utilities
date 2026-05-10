@@ -11,7 +11,7 @@
     "logPerPollClassifier": false,
     "clearToMajorDelaySeconds": 1.5,
     "maxIdenticalMajorCommands": 2,
-    "inputBoxScanLines": 5,
+    "inputBoxScanLines": 12,
     "busyMarkerScanLines": 30,
     "menuMaxNavigationSteps": 40,
     "menuKeyDelaySeconds": 0.1,
@@ -70,7 +70,13 @@
     "inputBoxBorderChars": ["╭", "╰", "│"],
     "usageLimitMenuOptions": [
       "Stop and wait for limit to reset",
-      "Upgrade your plan"
+      "Upgrade your plan",
+      "Stop and wait.{0,30}reset",
+      "usage limit reached"
+    ],
+    "usageLimitInlineMarkers": [
+      "hit your limit . resets",
+      "/extra-usage to finish"
     ],
     "waitForResetOption": [
       "Stop and wait for limit to reset"

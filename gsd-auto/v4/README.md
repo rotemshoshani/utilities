@@ -104,6 +104,7 @@ gsd-auto-v4 status      print controller state and flags
 gsd-auto-v4 pause       disable action injection
 gsd-auto-v4 resume      re-enable action injection
 gsd-auto-v4 stop-next   transition to COMPLETE before next major command
+gsd-auto-v4 kill-controller  hard-kill controller process only
 gsd-auto-v4 kill        hard-kill controller process and tmux session
 gsd-auto-v4 tail [-f]   tail controller log
 ```
