@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# dev-env — tmux session with controller bar + two dev-server panes.
+#
+# Layout (vertical stack — native OS mouse copy works per pane):
+#   ┌─────────────────────────────┐
+#   │  controller (single row)    │
+#   ├─────────────────────────────┤
+#   │  TOP cmd                    │
+#   ├─────────────────────────────┤
+#   │  BOTTOM cmd                 │
+#   └─────────────────────────────┘
+#
+# Defaults: TOP='npx convex dev', BOTTOM='npm run dev'.
+
+set -euo pipefail
+
+TOP_CMD="${DEV_ENV_TOP:-npx convex dev}"
+BOT_CMD="${DEV_ENV_BOTTOM:-npm run dev}"
+
+# ---- Runner subcommand (wraps each worker pane) ------------------------------
+# Keeps the pane alive after the command exits/crashes, so the user can read
+# the final output and restart it via the controller. Avoids the race where
+# `remain-on-exit on` is set too late.
+if [[ "${1:-}" == "__runner" ]]; then
+  shift
+  bash -c "$1"
+  ec=$?
+  printf '\n\033[1;31m[exited code=%d]\033[0m  Use the controller above to restart.\n' "$ec"
+  exec sleep infinity
+fi
+
+usage() {
+  cat <<EOF
+Usage: dev-env [--override CMD1 CMD2]
+
+Spawns a tmux session for the current directory:
+  - row 0 (top):    controller bar — single-keypress menu
+  - middle pane:    TOP command    (default: npx convex dev)
+  - bottom pane:    BOTTOM command (default: npm run dev)
+
+Controller keys (focus the controller pane, then press):
+  T = restart TOP    B = restart BOTTOM    A = restart BOTH    Q = kill all
+
+Options:
+  --override CMD1 CMD2   Override the top/bottom commands.
+  -h, --help             Show this help.
+
+Env: DEV_ENV_TOP, DEV_ENV_BOTTOM override the defaults.
+
+Re-running in a directory with an existing session attaches to it.
+EOF
+}
+
+# ---- Controller subcommand (runs inside the tmux pane) -----------------------
+if [[ "${1:-}" == "__controller" ]]; then
+  session="$2"
+
+  # If the controller exits for any reason, take the whole session with it.
+  trap 'tmux kill-session -t "$session" 2>/dev/null || true' EXIT
+
+  # Parent sets DEV_TOP_ID/etc. shortly after spawning this pane; tolerate the
+  # brief window where show-environment returns non-zero.
+  set +e
+  set +o pipefail
+
+  # ANSI helpers
+  ESC=$'\033'
+  CLR="${ESC}[2J${ESC}[H"   # clear screen + home
+  BOLD="${ESC}[1m"
+  DIM="${ESC}[2m"
+  CYAN="${ESC}[36m"
+  RED="${ESC}[31m"
+  RESET="${ESC}[0m"
+
+  render() {
+    local top_cmd="$1" bot_cmd="$2"
+    printf '%s' "$CLR"
+    printf '%sdev-env%s  ' "$BOLD$CYAN" "$RESET"
+    printf '%s[T]%s top (%s)   ' "$BOLD" "$RESET" "$top_cmd"
+    printf '%s[B]%s bottom (%s)   ' "$BOLD" "$RESET" "$bot_cmd"
+    printf '%s[A]%s both   ' "$BOLD" "$RESET"
+    printf '%s[Q]%s kill' "$BOLD$RED" "$RESET"
+  }
+
+  while true; do
+    top_id=$(tmux show-environment -t "$session" DEV_TOP_ID 2>/dev/null | cut -d= -f2-)
+    bot_id=$(tmux show-environment -t "$session" DEV_BOT_ID 2>/dev/null | cut -d= -f2-)
+    top_cmd=$(tmux show-environment -t "$session" DEV_TOP_CMD 2>/dev/null | cut -d= -f2-)
+    bot_cmd=$(tmux show-environment -t "$session" DEV_BOT_CMD 2>/dev/null | cut -d= -f2-)
+
+    render "${top_cmd:-?}" "${bot_cmd:-?}"
+
+    # Single keypress, silent, raw (-s suppresses echo, -n1 reads one char).
+    IFS= read -rsn1 key || { sleep 0.1; continue; }
+
+    case "$key" in
+      t|T) [[ -n "$top_id" ]] && tmux respawn-pane -k -t "$top_id" ;;
+      b|B) [[ -n "$bot_id" ]] && tmux respawn-pane -k -t "$bot_id" ;;
+      a|A)
+        [[ -n "$top_id" ]] && tmux respawn-pane -k -t "$top_id"
+        [[ -n "$bot_id" ]] && tmux respawn-pane -k -t "$bot_id"
+        ;;
+      q|Q)
+        tmux kill-session -t "$session"
+        exit 0
+        ;;
+      *) : ;;  # ignore other keys
+    esac
+  done
+fi
+
+# ---- Arg parsing -------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --override)
+      [[ $# -ge 3 ]] || { echo "--override needs 2 args: CMD1 CMD2" >&2; exit 1; }
+      TOP_CMD="$2"
+      BOT_CMD="$3"
+      shift 3
+      ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown arg: $1" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+command -v tmux >/dev/null 2>&1 || { echo "dev-env: tmux not installed" >&2; exit 1; }
+
+PROJ_DIR="$(pwd)"
+SELF="$(readlink -f "$0")"
+SESSION="dev-$(basename "$PROJ_DIR" | tr -c '[:alnum:]_-' '_' | tr -s '_' | sed 's/^_//; s/_$//')"
+
+# Attach if session already exists
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  if [[ -n "${TMUX:-}" ]]; then
+    exec tmux switch-client -t "$SESSION"
+  else
+    exec tmux attach-session -t "$SESSION"
+  fi
+fi
+
+# Controller command (properly quoted for tmux's shell invocation)
+CTRL_CMD=$(printf '%q __controller %q' "$SELF" "$SESSION")
+
+# Detect real terminal size; tmux new-session -d defaults to 80x24 otherwise,
+# and the resulting proportional layout makes CTRL fatter after attach.
+TERM_W=$(tput cols 2>/dev/null || echo 200)
+TERM_H=$(tput lines 2>/dev/null || echo 50)
+
+# Create session: pane 0 = controller (fills the whole window for now)
+CTRL_ID=$(tmux new-session -d -s "$SESSION" -n dev -c "$PROJ_DIR" \
+            -x "$TERM_W" -y "$TERM_H" \
+            -P -F '#{pane_id}' "$CTRL_CMD")
+
+# Set up the status bar BEFORE splits so window_height reflects the final layout.
+tmux set-option -t "$SESSION" status on
+tmux set-option -t "$SESSION" status-position top
+tmux set-option -t "$SESSION" status-style "bg=default,fg=default"
+tmux set-option -t "$SESSION" status-left-length 80
+tmux set-option -t "$SESSION" status-left "#[fg=cyan,bold] $(basename "$PROJ_DIR") #[fg=default,nobold]"
+tmux set-option -t "$SESSION" status-right ""
+tmux set-option -t "$SESSION" window-status-format " "
+tmux set-option -t "$SESSION" window-status-current-format " "
+tmux set-option -t "$SESSION" status-justify left
+
+# Worker commands run through __runner so they survive exit/crash
+TOP_RUN=$(printf '%q __runner %q' "$SELF" "$TOP_CMD")
+BOT_RUN=$(printf '%q __runner %q' "$SELF" "$BOT_CMD")
+
+# Split TOP off the controller. Size the NEW pane (TOP) so CTRL ends up at 1 row.
+# `-l N` sets the new pane to N lines. Account for the 1-row pane border:
+#   CTRL = WIN_H - TOP_SIZE - 1(border) → TOP_SIZE = WIN_H - 2 to leave CTRL=1.
+WIN_H=$(tmux display-message -p -t "$CTRL_ID" '#{window_height}')
+TOP_SIZE=$(( WIN_H > 4 ? WIN_H - 2 : WIN_H / 2 ))
+TOP_ID=$(tmux split-window -t "$CTRL_ID" -v -l "$TOP_SIZE" -c "$PROJ_DIR" \
+           -P -F '#{pane_id}' "$TOP_RUN")
+
+# Split TOP evenly into TOP/BOTTOM (no -l → tmux splits 50/50)
+BOT_ID=$(tmux split-window -t "$TOP_ID" -v -c "$PROJ_DIR" \
+           -P -F '#{pane_id}' "$BOT_RUN")
+
+# Stash IDs + cmds in session env so the controller can read them
+tmux set-environment -t "$SESSION" DEV_TOP_ID  "$TOP_ID"
+tmux set-environment -t "$SESSION" DEV_BOT_ID  "$BOT_ID"
+tmux set-environment -t "$SESSION" DEV_TOP_CMD "$TOP_CMD"
+tmux set-environment -t "$SESSION" DEV_BOT_CMD "$BOT_CMD"
+
+# Focus the controller pane so single-keypress menu is live on attach
+tmux select-pane -t "$CTRL_ID"
+
+# Attach (or switch, if already inside tmux)
+if [[ -n "${TMUX:-}" ]]; then
+  exec tmux switch-client -t "$SESSION"
+else
+  exec tmux attach-session -t "$SESSION"
+fi
