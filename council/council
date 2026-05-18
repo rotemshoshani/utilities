@@ -91,6 +91,59 @@ record_action() {
   tmux set-environment -t "$session" COUNCIL_LAST_TIME   "$(date +%H:%M:%S)" 2>/dev/null || true
 }
 
+# Launch a known terminal emulator by name with CMD inside it.
+# Returns 0 on dispatch, 1 if the name is unknown (caller falls back).
+launch_terminal() {
+  local term="$1" cmd="$2" title="$3"
+  case "$term" in
+    gnome-terminal) setsid -f gnome-terminal --title="$title" -- bash -c "$cmd"           </dev/null >/dev/null 2>&1 ;;
+    konsole)        setsid -f konsole --separate -p "tabtitle=$title" -e bash -c "$cmd"   </dev/null >/dev/null 2>&1 ;;
+    ghostty)        setsid -f ghostty -e "bash -c \"$cmd\""                               </dev/null >/dev/null 2>&1 ;;
+    wezterm)        setsid -f wezterm start --always-new-process -- bash -c "$cmd"        </dev/null >/dev/null 2>&1 ;;
+    kitty)          setsid -f kitty --title "$title" bash -c "$cmd"                       </dev/null >/dev/null 2>&1 ;;
+    alacritty)      setsid -f alacritty --title "$title" -e bash -c "$cmd"                </dev/null >/dev/null 2>&1 ;;
+    foot)           setsid -f foot --title "$title" bash -c "$cmd"                        </dev/null >/dev/null 2>&1 ;;
+    tilix)          setsid -f tilix --title "$title" -e bash -c "$cmd"                    </dev/null >/dev/null 2>&1 ;;
+    terminator)     setsid -f terminator --title="$title" -x bash -c "$cmd"               </dev/null >/dev/null 2>&1 ;;
+    xterm)          setsid -f xterm -title "$title" -e bash -c "$cmd"                     </dev/null >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Launch a GUI terminal window running CMD. Detached via setsid so it
+# outlives the council script. Returns 0 if a terminal emulator was found
+# and dispatched; 1 if none was usable (caller falls back to tmux-only).
+#
+# COUNCIL_TERMINAL overrides detection. Two forms:
+#   - bare name (e.g. "sakura", "kitty") — looked up in launch_terminal
+#   - free-form invocation with %CMD placeholder for the inner command
+#     (e.g. "my-term --opt %CMD"); if no %CMD, CMD is appended
+spawn_terminal() {
+  local cmd="$1" title="${2:-council}"
+
+  if [[ -n "${COUNCIL_TERMINAL:-}" ]]; then
+    # Try bare-name form first.
+    launch_terminal "$COUNCIL_TERMINAL" "$cmd" "$title" && return 0
+    # Otherwise treat it as a free-form invocation.
+    local invocation="${COUNCIL_TERMINAL//\%CMD/$cmd}"
+    [[ "$invocation" == "$COUNCIL_TERMINAL" ]] && invocation="${COUNCIL_TERMINAL} ${cmd}"
+    setsid -f sh -c "$invocation" </dev/null >/dev/null 2>&1
+    return $?
+  fi
+
+  # Autodetect order. Sakura intentionally omitted — its -e/-x execute
+  # flags interact poorly with attaching to a tmux session via bash -c
+  # (windows close instantly on attach). Foot is the next sensible default
+  # on this dev box and works reliably.
+  local term
+  for term in gnome-terminal konsole ghostty wezterm kitty alacritty foot tilix terminator xterm; do
+    if command -v "$term" >/dev/null 2>&1; then
+      launch_terminal "$term" "$cmd" "$title" && return 0
+    fi
+  done
+  return 1
+}
+
 # ---- Runner: keeps a pane alive after its command exits/crashes -------------
 if [[ "${1:-}" == "__runner" ]]; then
   shift
@@ -299,6 +352,90 @@ if [[ "${1:-}" == "__broadcast" ]]; then
   exit 0
 fi
 
+# ---- Breakup: detach each AI pane into its own GUI terminal window --------
+# After brainstorming, lets the user keep working with claude / codex like
+# regular standalone terminals. We move each AI pane into its own tmux
+# session (preserves the running process), hide tmux chrome so the spawned
+# windows feel like a plain terminal, then launch a new terminal-emulator
+# window attached to each session. Council itself is torn down.
+#
+# If no terminal emulator is detected (or fails to launch), falls back to
+# leaving the two tmux sessions alive and dropping the user into claude's
+# session in the current window.
+if [[ "${1:-}" == "__breakup" ]]; then
+  claude_pane="$2"
+  codex_pane="$3"
+  session="$4"
+  projname="${session#council-}"
+
+  claude_sess="claude-${projname}"
+  codex_sess="codex-${projname}"
+
+  # Create placeholder sessions, then move each AI pane in. The placeholder
+  # window gets killed after the real window arrives.
+  if ! tmux has-session -t "$claude_sess" 2>/dev/null; then
+    tmux new-session -d -s "$claude_sess" -n __placeholder 'sleep infinity'
+  fi
+  if ! tmux has-session -t "$codex_sess" 2>/dev/null; then
+    tmux new-session -d -s "$codex_sess" -n __placeholder 'sleep infinity'
+  fi
+
+  cwin=$(tmux break-pane -d -P -F '#{window_id}' -s "$claude_pane" -n claude 2>/dev/null) || cwin=""
+  if [[ -n "$cwin" ]]; then
+    tmux move-window -s "$cwin" -t "${claude_sess}:" 2>/dev/null
+    tmux kill-window -t "${claude_sess}:__placeholder" 2>/dev/null
+  else
+    tmux kill-session -t "$claude_sess" 2>/dev/null
+  fi
+
+  xwin=$(tmux break-pane -d -P -F '#{window_id}' -s "$codex_pane" -n codex 2>/dev/null) || xwin=""
+  if [[ -n "$xwin" ]]; then
+    tmux move-window -s "$xwin" -t "${codex_sess}:" 2>/dev/null
+    tmux kill-window -t "${codex_sess}:__placeholder" 2>/dev/null
+  else
+    tmux kill-session -t "$codex_sess" 2>/dev/null
+  fi
+
+  # Make each session look like a plain terminal: no status bar, mouse on,
+  # destroy the session when the last client detaches (so closing the
+  # terminal window cleans up automatically).
+  for sess in "$claude_sess" "$codex_sess"; do
+    tmux has-session -t "$sess" 2>/dev/null || continue
+    tmux set-option  -t "$sess" status off                    2>/dev/null
+    tmux set-option  -t "$sess" mouse on                      2>/dev/null
+    tmux set-option  -t "$sess" destroy-unattached off        2>/dev/null
+    tmux set-option  -t "$sess" remain-on-exit off            2>/dev/null
+  done
+
+  # Try to spawn a GUI terminal window per session. `exec` so when the AI
+  # exits, tmux exits, the wrapping shell exits, and the terminal closes.
+  spawned=0
+  if tmux has-session -t "$claude_sess" 2>/dev/null \
+     && spawn_terminal "exec tmux attach-session -t ${claude_sess}" "claude · ${projname}"; then
+    spawned=$((spawned + 1))
+  fi
+  if tmux has-session -t "$codex_sess" 2>/dev/null \
+     && spawn_terminal "exec tmux attach-session -t ${codex_sess}" "codex · ${projname}"; then
+    spawned=$((spawned + 1))
+  fi
+
+  if (( spawned == 0 )); then
+    # No terminal emulator on PATH — fall back to taking over the current
+    # window with claude and pointing the user at codex via tmux.
+    tmux switch-client -t "$claude_sess" 2>/dev/null || true
+    tmux display-message -t "$claude_sess" \
+      "no terminal emulator detected — set COUNCIL_TERMINAL or attach: tmux a -t ${codex_sess}" 2>/dev/null
+    tmux kill-session -t "$session" 2>/dev/null
+    exit 0
+  fi
+
+  # Give the new windows a moment to render before we kill council and the
+  # current terminal returns to its shell.
+  sleep 0.5
+  tmux kill-session -t "$session" 2>/dev/null
+  exit 0
+fi
+
 # ---- Controller subcommand --------------------------------------------------
 if [[ "${1:-}" == "__controller" ]]; then
   session="$2"
@@ -336,11 +473,13 @@ if [[ "${1:-}" == "__controller" ]]; then
     printf '%scouncil%s  ' "$BOLD$MAGENTA" "$RESET"
     printf '%s[A]%s claude -> codex   ' "$a_pre" "$RESET"
     printf '%s[S]%s claude <- codex   ' "$s_pre" "$RESET"
-    printf '%s[P]%s claude <-> codex  ' "$p_pre" "$RESET"
-    printf '%s[Q]%s kill\n'             "$BOLD$RED" "$RESET"
+    printf '%s[P]%s claude <-> codex   ' "$p_pre" "$RESET"
+    printf '%s[B]%s split   '            "$BOLD$GREEN" "$RESET"
+    printf '%s[Q]%s kill\n'              "$BOLD$RED" "$RESET"
     printf '\n'
     printf '  %sA / S%s relay one model'\''s last reply to the other for their take.\n'  "$DIM" "$RESET"
     printf '  %sP%s     opens a multi-line prompt here and broadcasts to both.\n'        "$DIM" "$RESET"
+    printf '  %sB%s     pop claude and codex into separate terminal windows; exit council.\n' "$DIM" "$RESET"
     printf '  %sCtrl-b z%s zooms the focused pane (for clean copying out of one AI).\n'  "$DIM" "$RESET"
 
     if [[ -n "$last_action" ]]; then
@@ -378,6 +517,10 @@ if [[ "${1:-}" == "__controller" ]]; then
       p|P)
         [[ -n "$claude_id" && -n "$codex_id" ]] && \
           "$self" __broadcast "$claude_id" "$codex_id" "$session"
+        ;;
+      b|B)
+        [[ -n "$claude_id" && -n "$codex_id" ]] && \
+          "$self" __breakup "$claude_id" "$codex_id" "$session"
         ;;
       q|Q)
         tmux kill-session -t "$session"
