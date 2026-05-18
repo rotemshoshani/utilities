@@ -23,7 +23,10 @@ set -euo pipefail
 CLAUDE_CMD="${COUNCIL_CLAUDE:-claude --dangerously-skip-permissions}"
 CODEX_CMD="${COUNCIL_CODEX:-codex}"
 APPROVAL_KEY="${COUNCIL_APPROVAL_KEY:-p}"
-CAPTURE_LINES="${COUNCIL_CAPTURE_LINES:-500}"
+# Generous capture window so the prior-relay END marker (used to clip
+# already-seen content from the top) stays reachable across longer
+# back-and-forth between relays. tmux history-limit is 200000.
+CAPTURE_LINES="${COUNCIL_CAPTURE_LINES:-2000}"
 
 # Patterns that indicate each TUI is idle and the input box is accepting
 # keystrokes. The intro paste waits until these match before firing, so a
@@ -32,11 +35,14 @@ CLAUDE_READY_PATTERN="${COUNCIL_CLAUDE_READY:-tab to cycle}"
 CODEX_READY_PATTERN="${COUNCIL_CODEX_READY:-Context [0-9]+% left}"
 READY_TIMEOUT="${COUNCIL_READY_TIMEOUT:-180}"
 
-# Bottom-of-pane chrome trim. We anchor on a stable marker that only appears
-# in the TUI's status/footer, then cut from a few lines above it through the
-# bottom — eating the input box (including any ghost-autocomplete) and status.
-CLAUDE_CHROME_MARKER="${COUNCIL_CLAUDE_CHROME:-tab to cycle}"
-CLAUDE_CHROME_LINES="${COUNCIL_CLAUDE_CHROME_LINES:-7}"
+# Bottom-of-pane chrome trim. The TUI's bottom state can be one of a few
+# things (idle input box, selection menu, etc.) and the chrome footprint
+# differs per state. So markers + cut-back are pipe-separated, aligned by
+# index. The first matching alternative (scanning the pane bottom-up) wins.
+# For Claude's menu state ("Enter to select · ↑/↓ to navigate") the cut
+# point is refined by scanning upward for the menu box top border.
+CLAUDE_CHROME_MARKER="${COUNCIL_CLAUDE_CHROME:-tab to cycle|Enter to select}"
+CLAUDE_CHROME_LINES="${COUNCIL_CLAUDE_CHROME_LINES:-7|9}"
 CODEX_CHROME_MARKER="${COUNCIL_CODEX_CHROME:-Context [0-9]+% left}"
 CODEX_CHROME_LINES="${COUNCIL_CODEX_CHROME_LINES:-5}"
 
@@ -59,9 +65,30 @@ paste_to() {
   # timing-based paste heuristic) and newlines stay as newlines instead of
   # being translated to \r (which would submit each line separately).
   tmux paste-buffer -b "$buf" -t "$pane" -p -d 2>/dev/null || return 1
-  # Bracketed paste of a long message takes a moment for the TUI to consume.
-  sleep 0.6
+  # Bracketed-paste delivery + TUI processing both scale with content size.
+  # If Enter is sent before the close marker is fully consumed, the TUI is
+  # still in paste mode and Enter gets eaten as content instead of submit.
+  # Adaptive settle by message size, with COUNCIL_PASTE_SETTLE as a fixed
+  # override.
+  local settle="${COUNCIL_PASTE_SETTLE:-}"
+  if [[ -z "$settle" ]]; then
+    local len=${#msg}
+    if   (( len <   500 )); then settle=1.5
+    elif (( len <  5000 )); then settle=2.5
+    elif (( len < 20000 )); then settle=4.0
+    else                         settle=6.0
+    fi
+  fi
+  sleep "$settle"
   tmux send-keys -t "$pane" Enter
+}
+
+# Record the last controller action in tmux env so the controller's render
+# loop can show what just fired (and highlight the matching key chip).
+record_action() {
+  local session="$1" action="$2"
+  tmux set-environment -t "$session" COUNCIL_LAST_ACTION "$action" 2>/dev/null || true
+  tmux set-environment -t "$session" COUNCIL_LAST_TIME   "$(date +%H:%M:%S)" 2>/dev/null || true
 }
 
 # ---- Runner: keeps a pane alive after its command exits/crashes -------------
@@ -147,10 +174,34 @@ if [[ "${1:-}" == "__relay" ]]; then
   src="$2"
   dst="$3"
   src_name="$4"      # "Claude" or "Codex"
+  session="${5:-}"
 
   raw=$(tmux capture-pane -p -J -t "$src" -S "-${CAPTURE_LINES}" 2>/dev/null || true)
   # Strip CSI escape sequences and OSC hyperlinks
   clean=$(printf '%s' "$raw" | sed -E $'s/\x1b\\[[0-9;?]*[ -/]*[@-~]//g; s/\x1b\\][^\x07]*\x07//g; s/\x1b[()][AB012]//g')
+
+  # Top-clip: every relay paste ends with "--- END <SRC> PANE CAPTURE ---".
+  # When we capture src's pane now, the prior relay INTO src came FROM the
+  # OTHER model — so the most recent "--- END <OTHER> PANE CAPTURE ---" in
+  # src's scrollback is the boundary between already-seen and new content.
+  # Clip everything at-and-above that marker. First relay (no prior tag)
+  # falls through unclipped — bottom chrome-trim still runs, and the model
+  # gets the full visible context which is usually short at that point.
+  if [[ "$src_name" == "Claude" ]]; then
+    prior_end="--- END CODEX PANE CAPTURE ---"
+  else
+    prior_end="--- END CLAUDE PANE CAPTURE ---"
+  fi
+  clean=$(printf '%s\n' "$clean" | awk -v marker="$prior_end" '
+    { lines[NR] = $0 }
+    END {
+      start = 1
+      for (i = NR; i >= 1; i--) {
+        if (index(lines[i], marker)) { start = i + 1; break }
+      }
+      for (i = start; i <= NR; i++) print lines[i]
+    }
+  ')
 
   # Drop the bottom input box + status chrome by anchoring on a stable marker
   # in the very last status line, then cutting N lines from there upward.
@@ -160,12 +211,33 @@ if [[ "${1:-}" == "__relay" ]]; then
   else
     chrome_marker="$CODEX_CHROME_MARKER";  chrome_back="$CODEX_CHROME_LINES"
   fi
-  clean=$(printf '%s\n' "$clean" | awk -v marker="$chrome_marker" -v back="$chrome_back" '
+  clean=$(printf '%s\n' "$clean" | awk -v markers="$chrome_marker" -v backs="$chrome_back" '
+    BEGIN {
+      nm = split(markers, M, "|")
+      nb = split(backs,   B, "|")
+      # If fewer back-counts than markers, reuse the last one.
+      for (i = nb + 1; i <= nm; i++) B[i] = B[nb]
+    }
     { lines[NR] = $0 }
     END {
       cut = NR + 1
       for (i = NR; i >= 1; i--) {
-        if (lines[i] ~ marker) { cut = i - back; if (cut < 1) cut = 1; break }
+        for (j = 1; j <= nm; j++) {
+          if (lines[i] ~ M[j]) {
+            cut = i - B[j]
+            # Menu state: the box height varies with the number of options,
+            # so prefer scanning upward for the box top (╭ or ┌) and cut
+            # from there. Falls back to the fixed B[j] if no box found.
+            if (M[j] ~ /Enter to select/) {
+              for (k = i - 1; k >= i - 40 && k >= 1; k--) {
+                if (lines[k] ~ /[╭┌]/) { cut = k; break }
+              }
+            }
+            if (cut < 1) cut = 1
+            break
+          }
+        }
+        if (cut <= NR) break
       }
       # Also eat trailing blank/separator lines just above the cut.
       while (cut > 1 && (lines[cut-1] ~ /^[[:space:]]*─+[[:space:]]*$/ || lines[cut-1] ~ /^[[:space:]]*$/)) cut--
@@ -185,6 +257,13 @@ EOF
 )
 
   paste_to "$dst" "$msg"
+  if [[ -n "$session" ]]; then
+    if [[ "$src_name" == "Claude" ]]; then
+      record_action "$session" "claude→codex"
+    else
+      record_action "$session" "codex→claude"
+    fi
+  fi
   exit 0
 fi
 
@@ -192,6 +271,7 @@ fi
 if [[ "${1:-}" == "__broadcast" ]]; then
   claude_pane="$2"
   codex_pane="$3"
+  session="${4:-}"
 
   {
     printf '\n\033[1;33mEnter a question for both AIs.\033[0m\n'
@@ -215,6 +295,7 @@ if [[ "${1:-}" == "__broadcast" ]]; then
   for pane in "$claude_pane" "$codex_pane"; do
     paste_to "$pane" "$msg"
   done
+  [[ -n "$session" ]] && record_action "$session" "broadcast"
   exit 0
 fi
 
@@ -231,42 +312,70 @@ if [[ "${1:-}" == "__controller" ]]; then
   CLR="${ESC}[2J${ESC}[H"
   BOLD="${ESC}[1m"
   DIM="${ESC}[2m"
+  REV="${ESC}[7m"
   MAGENTA="${ESC}[35m"
   CYAN="${ESC}[36m"
   YELLOW="${ESC}[33m"
+  GREEN="${ESC}[32m"
   RED="${ESC}[31m"
   RESET="${ESC}[0m"
 
   render() {
+    # Highlight the chip whose action just fired so the user can see at a
+    # glance which direction was last relayed.
+    local a_pre="$BOLD$CYAN" s_pre="$BOLD$CYAN" p_pre="$BOLD$YELLOW"
+    case "$last_action" in
+      "claude→codex") a_pre="$REV$BOLD$CYAN"   ;;
+      "codex→claude") s_pre="$REV$BOLD$CYAN"   ;;
+      "broadcast")    p_pre="$REV$BOLD$YELLOW" ;;
+    esac
+
     printf '%s' "$CLR"
     printf '%scouncil%s  ' "$BOLD$MAGENTA" "$RESET"
-    printf '%s[A]%s claude→codex   ' "$BOLD$CYAN" "$RESET"
-    printf '%s[S]%s codex→claude   ' "$BOLD$CYAN" "$RESET"
-    printf '%s[P]%s prompt both   '  "$BOLD$YELLOW" "$RESET"
+    printf '%s[A]%s claude→codex   ' "$a_pre" "$RESET"
+    printf '%s[S]%s codex→claude   ' "$s_pre" "$RESET"
+    printf '%s[P]%s prompt both   '  "$p_pre" "$RESET"
     printf '%s[Q]%s kill\n'           "$BOLD$RED" "$RESET"
     printf '\n'
     printf '  %sA / S%s relay one model'\''s last reply to the other for their take.\n'  "$DIM" "$RESET"
     printf '  %sP%s     opens a multi-line prompt here and broadcasts to both.\n'        "$DIM" "$RESET"
     printf '  %sCtrl-b z%s zooms the focused pane (for clean copying out of one AI).\n'  "$DIM" "$RESET"
+
+    if [[ -n "$last_action" ]]; then
+      local label
+      case "$last_action" in
+        "claude→codex") label="claude → codex" ;;
+        "codex→claude") label="codex → claude" ;;
+        "broadcast")    label="broadcast → both" ;;
+        *)              label="$last_action"    ;;
+      esac
+      printf '\n  %slast:%s %s%s%s%s   %s%s%s\n' \
+        "$DIM" "$RESET" "$BOLD" "$GREEN" "$label" "$RESET" "$DIM" "$last_time" "$RESET"
+    fi
   }
 
   while true; do
     claude_id=$(tmux show-environment -t "$session" COUNCIL_CLAUDE_ID 2>/dev/null | cut -d= -f2-)
     codex_id=$(tmux show-environment -t "$session" COUNCIL_CODEX_ID  2>/dev/null | cut -d= -f2-)
+    last_action=$(tmux show-environment -t "$session" COUNCIL_LAST_ACTION 2>/dev/null | cut -d= -f2-)
+    last_time=$(tmux show-environment   -t "$session" COUNCIL_LAST_TIME   2>/dev/null | cut -d= -f2-)
+    # show-environment prints "-NAME" when unset; strip that to empty.
+    [[ "$last_action" == "-COUNCIL_LAST_ACTION"* ]] && last_action=""
+    [[ "$last_time"   == "-COUNCIL_LAST_TIME"*   ]] && last_time=""
     render
     IFS= read -rsn1 key || { sleep 0.1; continue; }
     case "$key" in
       a|A)
         [[ -n "$claude_id" && -n "$codex_id" ]] && \
-          "$self" __relay "$claude_id" "$codex_id" Claude
+          "$self" __relay "$claude_id" "$codex_id" Claude "$session"
         ;;
       s|S)
         [[ -n "$claude_id" && -n "$codex_id" ]] && \
-          "$self" __relay "$codex_id" "$claude_id" Codex
+          "$self" __relay "$codex_id" "$claude_id" Codex "$session"
         ;;
       p|P)
         [[ -n "$claude_id" && -n "$codex_id" ]] && \
-          "$self" __broadcast "$claude_id" "$codex_id"
+          "$self" __broadcast "$claude_id" "$codex_id" "$session"
         ;;
       q|Q)
         tmux kill-session -t "$session"
