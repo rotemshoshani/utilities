@@ -321,8 +321,10 @@ if [[ "${1:-}" == "__controller" ]]; then
   RESET="${ESC}[0m"
 
   render() {
-    # Highlight the chip whose action just fired so the user can see at a
-    # glance which direction was last relayed.
+    # Keep claude/codex in fixed columns across all chips and the last-action
+    # footer — only the middle arrow changes per direction. Mirrors the
+    # physical layout (claude pane on the left, codex on the right) so the
+    # arrow always points at where data is going.
     local a_pre="$BOLD$CYAN" s_pre="$BOLD$CYAN" p_pre="$BOLD$YELLOW"
     case "$last_action" in
       "claude→codex") a_pre="$REV$BOLD$CYAN"   ;;
@@ -332,10 +334,10 @@ if [[ "${1:-}" == "__controller" ]]; then
 
     printf '%s' "$CLR"
     printf '%scouncil%s  ' "$BOLD$MAGENTA" "$RESET"
-    printf '%s[A]%s claude→codex   ' "$a_pre" "$RESET"
-    printf '%s[S]%s codex→claude   ' "$s_pre" "$RESET"
-    printf '%s[P]%s prompt both   '  "$p_pre" "$RESET"
-    printf '%s[Q]%s kill\n'           "$BOLD$RED" "$RESET"
+    printf '%s[A]%s claude -> codex   ' "$a_pre" "$RESET"
+    printf '%s[S]%s claude <- codex   ' "$s_pre" "$RESET"
+    printf '%s[P]%s claude <-> codex  ' "$p_pre" "$RESET"
+    printf '%s[Q]%s kill\n'             "$BOLD$RED" "$RESET"
     printf '\n'
     printf '  %sA / S%s relay one model'\''s last reply to the other for their take.\n'  "$DIM" "$RESET"
     printf '  %sP%s     opens a multi-line prompt here and broadcasts to both.\n'        "$DIM" "$RESET"
@@ -344,10 +346,10 @@ if [[ "${1:-}" == "__controller" ]]; then
     if [[ -n "$last_action" ]]; then
       local label
       case "$last_action" in
-        "claude→codex") label="claude → codex" ;;
-        "codex→claude") label="codex → claude" ;;
-        "broadcast")    label="broadcast → both" ;;
-        *)              label="$last_action"    ;;
+        "claude→codex") label="claude -> codex"  ;;
+        "codex→claude") label="claude <- codex"  ;;
+        "broadcast")    label="claude <-> codex" ;;
+        *)              label="$last_action"     ;;
       esac
       printf '\n  %slast:%s %s%s%s%s   %s%s%s\n' \
         "$DIM" "$RESET" "$BOLD" "$GREEN" "$label" "$RESET" "$DIM" "$last_time" "$RESET"
@@ -469,10 +471,11 @@ CLAUDE_RUN=$(printf '%q __runner %q' "$SELF" "$CLAUDE_CMD")
 CODEX_RUN=$(printf  '%q __runner %q' "$SELF" "$CODEX_CMD")
 
 # Split a fat region below the controller (claude takes the whole lower region first).
-# Controller takes ~6 rows so the P prompt has room to render its multi-line input
-# without cramping; everything below the border belongs to the AI panes.
+# Controller takes ~10 rows so the menu, hints, last-action line, and the P
+# multi-line prompt all have room to render without cramping; everything
+# below the border belongs to the AI panes.
 WIN_H=$(tmux display-message -p -t "$CTRL_ID" '#{window_height}')
-LOWER_SIZE=$(( WIN_H > 10 ? WIN_H - 7 : WIN_H / 2 ))
+LOWER_SIZE=$(( WIN_H > 13 ? WIN_H - 10 : WIN_H / 2 ))
 CLAUDE_ID=$(tmux split-window -t "$CTRL_ID" -v -l "$LOWER_SIZE" -c "$PROJ_DIR" \
               -P -F '#{pane_id}' "$CLAUDE_RUN")
 
