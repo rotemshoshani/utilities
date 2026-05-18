@@ -1,0 +1,391 @@
+#!/usr/bin/env bash
+# council — tmux session for brainstorming with Claude Code + Codex side-by-side.
+#
+# Layout:
+#   ┌─────────────────────────────────────────────┐
+#   │  controller (single row)                    │
+#   ├─────────────────────┬───────────────────────┤
+#   │  claude             │  codex (auto-approve) │
+#   └─────────────────────┴───────────────────────┘
+#
+# Controller keys (focus controller pane, then press):
+#   A = capture Claude's pane → paste into Codex with "Claude said…" wrapper
+#   S = capture Codex's pane  → paste into Claude with "Codex said…"  wrapper
+#   P = prompt user, broadcast same question to both panes
+#   Q = kill everything
+#
+# Horizontal split makes OS-native row-spanning copy awkward; use tmux zoom
+# (Ctrl-b z) on the focused pane to copy from one AI cleanly, then Ctrl-b z
+# again to restore the split.
+
+set -euo pipefail
+
+CLAUDE_CMD="${COUNCIL_CLAUDE:-claude --dangerously-skip-permissions}"
+CODEX_CMD="${COUNCIL_CODEX:-codex}"
+APPROVAL_KEY="${COUNCIL_APPROVAL_KEY:-p}"
+CAPTURE_LINES="${COUNCIL_CAPTURE_LINES:-500}"
+
+# Patterns that indicate each TUI is idle and the input box is accepting
+# keystrokes. The intro paste waits until these match before firing, so a
+# startup modal (update available, login, etc.) won't swallow the message.
+CLAUDE_READY_PATTERN="${COUNCIL_CLAUDE_READY:-tab to cycle}"
+CODEX_READY_PATTERN="${COUNCIL_CODEX_READY:-Context [0-9]+% left}"
+READY_TIMEOUT="${COUNCIL_READY_TIMEOUT:-180}"
+
+# Bottom-of-pane chrome trim. We anchor on a stable marker that only appears
+# in the TUI's status/footer, then cut from a few lines above it through the
+# bottom — eating the input box (including any ghost-autocomplete) and status.
+CLAUDE_CHROME_MARKER="${COUNCIL_CLAUDE_CHROME:-tab to cycle}"
+CLAUDE_CHROME_LINES="${COUNCIL_CLAUDE_CHROME_LINES:-7}"
+CODEX_CHROME_MARKER="${COUNCIL_CODEX_CHROME:-Context [0-9]+% left}"
+CODEX_CHROME_LINES="${COUNCIL_CODEX_CHROME_LINES:-5}"
+
+# ---- Shared helpers ---------------------------------------------------------
+# Paste a (potentially large, multi-line) message into a tmux pane and submit.
+# Uses load-buffer from stdin to avoid tmux's command-line length limit, which
+# `set-buffer -- "$msg"` runs into for big captures ("command too long").
+paste_to() {
+  local pane="$1" msg="$2"
+  local buf="council-$$-${RANDOM}"
+  # Strip trailing newlines so the bracketed paste doesn't leave a dangling
+  # blank line that some TUIs treat oddly.
+  msg="${msg%$'\n'}"
+  while [[ "${msg: -1}" == $'\n' ]]; do msg="${msg%$'\n'}"; done
+  if ! printf '%s' "$msg" | tmux load-buffer -b "$buf" - 2>/dev/null; then
+    return 1
+  fi
+  # -p forces real bracketed-paste markers around the whole buffer so the TUI
+  # sees one paste event (not several "[Pasted N chars]" chunks from its own
+  # timing-based paste heuristic) and newlines stay as newlines instead of
+  # being translated to \r (which would submit each line separately).
+  tmux paste-buffer -b "$buf" -t "$pane" -p -d 2>/dev/null || return 1
+  # Bracketed paste of a long message takes a moment for the TUI to consume.
+  sleep 0.6
+  tmux send-keys -t "$pane" Enter
+}
+
+# ---- Runner: keeps a pane alive after its command exits/crashes -------------
+if [[ "${1:-}" == "__runner" ]]; then
+  shift
+  bash -c "$1"
+  ec=$?
+  printf '\n\033[1;31m[exited code=%d]\033[0m  Session controller above (Q to quit).\n' "$ec"
+  exec sleep infinity
+fi
+
+# ---- Auto-approve watcher for the codex pane --------------------------------
+if [[ "${1:-}" == "__watch_codex" ]]; then
+  target="$2"
+  prompt_text="Would you like to run the following command?"
+  last_sig=""
+  last_at=0
+  while tmux display-message -p -t "$target" '#{pane_id}' >/dev/null 2>&1; do
+    screen=$(tmux capture-pane -p -J -t "$target" -S -120 2>/dev/null || true)
+    if [[ "$screen" == *"$prompt_text"* ]]; then
+      sig=$(printf '%s' "$screen" | cksum | awk '{print $1":"$2}')
+      now=$(date +%s)
+      if [[ "$sig" != "$last_sig" || $((now - last_at)) -ge 10 ]]; then
+        tmux send-keys -t "$target" "$APPROVAL_KEY"
+        last_sig="$sig"
+        last_at="$now"
+      fi
+    else
+      last_sig=""
+    fi
+    sleep 2
+  done
+  exit 0
+fi
+
+# ---- Initial-message sender (waits for each TUI to look idle) --------------
+if [[ "${1:-}" == "__init_msg" ]]; then
+  claude_pane="$2"
+  codex_pane="$3"
+
+  # Poll a pane's visible content until $pattern (extended regex) appears or
+  # $timeout seconds pass. Returns 0 if matched, 1 on timeout.
+  wait_for_ready() {
+    local pane="$1" pattern="$2" timeout="$3"
+    local start now
+    start=$(date +%s)
+    while :; do
+      now=$(date +%s)
+      if (( now - start >= timeout )); then return 1; fi
+      if tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1; then
+        if tmux capture-pane -p -J -t "$pane" -S -200 2>/dev/null \
+             | grep -Eq -- "$pattern"; then
+          # Add a small settle delay so the input box has fully drawn.
+          sleep 0.5
+          return 0
+        fi
+      fi
+      sleep 0.5
+    done
+  }
+
+  read -r -d '' CLAUDE_INTRO <<'EOF' || true
+You are brainstorming with the user as part of a "council". In a parallel tmux pane there is a separate Codex CLI session having the same conversation with the user. The user can capture your most recent reply and paste it into Codex (and vice versa), prefixed with "Codex said: ..." or similar. Be opinionated. Surface tradeoffs. Disagree with Codex when you have a real reason. Keep replies tight — this is a back-and-forth, not a monologue. No need to acknowledge this message; just brainstorm when the user asks.
+EOF
+
+  read -r -d '' CODEX_INTRO <<'EOF' || true
+You are brainstorming with the user as part of a "council". In a parallel tmux pane there is a separate Claude Code session having the same conversation with the user. The user can capture your most recent reply and paste it into Claude (and vice versa), prefixed with "Claude said: ..." or similar. Be opinionated. Surface tradeoffs. Disagree with Claude when you have a real reason. Keep replies tight — this is a back-and-forth, not a monologue. No need to acknowledge this message; just brainstorm when the user asks.
+EOF
+
+  # Wait for each TUI's idle marker before pasting — handles update prompts,
+  # login flows, slow first-render. Send anyway after the timeout to avoid
+  # getting permanently stuck if patterns drift.
+  wait_for_ready "$claude_pane" "$CLAUDE_READY_PATTERN" "$READY_TIMEOUT" || true
+  paste_to "$claude_pane" "$CLAUDE_INTRO"
+
+  wait_for_ready "$codex_pane"  "$CODEX_READY_PATTERN"  "$READY_TIMEOUT" || true
+  paste_to "$codex_pane"  "$CODEX_INTRO"
+  exit 0
+fi
+
+# ---- Relay: capture src pane, paste into dst pane wrapped in framing -------
+if [[ "${1:-}" == "__relay" ]]; then
+  src="$2"
+  dst="$3"
+  src_name="$4"      # "Claude" or "Codex"
+
+  raw=$(tmux capture-pane -p -J -t "$src" -S "-${CAPTURE_LINES}" 2>/dev/null || true)
+  # Strip CSI escape sequences and OSC hyperlinks
+  clean=$(printf '%s' "$raw" | sed -E $'s/\x1b\\[[0-9;?]*[ -/]*[@-~]//g; s/\x1b\\][^\x07]*\x07//g; s/\x1b[()][AB012]//g')
+
+  # Drop the bottom input box + status chrome by anchoring on a stable marker
+  # in the very last status line, then cutting N lines from there upward.
+  # This avoids matching `>` (markdown blockquote) or `❯` text inside replies.
+  if [[ "$src_name" == "Claude" ]]; then
+    chrome_marker="$CLAUDE_CHROME_MARKER"; chrome_back="$CLAUDE_CHROME_LINES"
+  else
+    chrome_marker="$CODEX_CHROME_MARKER";  chrome_back="$CODEX_CHROME_LINES"
+  fi
+  clean=$(printf '%s\n' "$clean" | awk -v marker="$chrome_marker" -v back="$chrome_back" '
+    { lines[NR] = $0 }
+    END {
+      cut = NR + 1
+      for (i = NR; i >= 1; i--) {
+        if (lines[i] ~ marker) { cut = i - back; if (cut < 1) cut = 1; break }
+      }
+      # Also eat trailing blank/separator lines just above the cut.
+      while (cut > 1 && (lines[cut-1] ~ /^[[:space:]]*─+[[:space:]]*$/ || lines[cut-1] ~ /^[[:space:]]*$/)) cut--
+      for (i = 1; i < cut; i++) print lines[i]
+    }
+  ')
+
+  msg=$(cat <<EOF
+The user is relaying ${src_name}'s pane to you for your take. Below is a raw capture of ${src_name}'s tmux pane (last ${CAPTURE_LINES} lines, includes TUI chrome — box borders, input prompts, status lines). Ignore the chrome and focus on ${src_name}'s most recent substantive reply (it'll be the last block of assistant text above the input box).
+
+What's your honest take? Agree, disagree, or build on it. If you'd push back, say why.
+
+--- BEGIN ${src_name^^} PANE CAPTURE ---
+${clean}
+--- END ${src_name^^} PANE CAPTURE ---
+EOF
+)
+
+  paste_to "$dst" "$msg"
+  exit 0
+fi
+
+# ---- Broadcast: ask user for a question, send to both panes ----------------
+if [[ "${1:-}" == "__broadcast" ]]; then
+  claude_pane="$2"
+  codex_pane="$3"
+
+  {
+    printf '\n\033[1;33mEnter a question for both AIs.\033[0m\n'
+    printf 'Multi-line OK. End with a line containing only "." (dot) or empty line.\n'
+    printf '> '
+  } > /dev/tty
+
+  msg=""
+  while IFS= read -r line < /dev/tty; do
+    [[ -z "$line" || "$line" == "." ]] && break
+    msg+="${line}"$'\n'
+  done
+  msg="${msg%$'\n'}"
+
+  if [[ -z "$msg" ]]; then
+    printf '\033[2m(empty, cancelled)\033[0m\n' > /dev/tty
+    sleep 0.6
+    exit 0
+  fi
+
+  for pane in "$claude_pane" "$codex_pane"; do
+    paste_to "$pane" "$msg"
+  done
+  exit 0
+fi
+
+# ---- Controller subcommand --------------------------------------------------
+if [[ "${1:-}" == "__controller" ]]; then
+  session="$2"
+  self="$3"
+
+  trap 'tmux kill-session -t "$session" 2>/dev/null || true' EXIT
+  set +e
+  set +o pipefail
+
+  ESC=$'\033'
+  CLR="${ESC}[2J${ESC}[H"
+  BOLD="${ESC}[1m"
+  DIM="${ESC}[2m"
+  MAGENTA="${ESC}[35m"
+  CYAN="${ESC}[36m"
+  YELLOW="${ESC}[33m"
+  RED="${ESC}[31m"
+  RESET="${ESC}[0m"
+
+  render() {
+    printf '%s' "$CLR"
+    printf '%scouncil%s  ' "$BOLD$MAGENTA" "$RESET"
+    printf '%s[A]%s claude→codex   ' "$BOLD$CYAN" "$RESET"
+    printf '%s[S]%s codex→claude   ' "$BOLD$CYAN" "$RESET"
+    printf '%s[P]%s prompt both   '  "$BOLD$YELLOW" "$RESET"
+    printf '%s[Q]%s kill\n'           "$BOLD$RED" "$RESET"
+    printf '\n'
+    printf '  %sA / S%s relay one model'\''s last reply to the other for their take.\n'  "$DIM" "$RESET"
+    printf '  %sP%s     opens a multi-line prompt here and broadcasts to both.\n'        "$DIM" "$RESET"
+    printf '  %sCtrl-b z%s zooms the focused pane (for clean copying out of one AI).\n'  "$DIM" "$RESET"
+  }
+
+  while true; do
+    claude_id=$(tmux show-environment -t "$session" COUNCIL_CLAUDE_ID 2>/dev/null | cut -d= -f2-)
+    codex_id=$(tmux show-environment -t "$session" COUNCIL_CODEX_ID  2>/dev/null | cut -d= -f2-)
+    render
+    IFS= read -rsn1 key || { sleep 0.1; continue; }
+    case "$key" in
+      a|A)
+        [[ -n "$claude_id" && -n "$codex_id" ]] && \
+          "$self" __relay "$claude_id" "$codex_id" Claude
+        ;;
+      s|S)
+        [[ -n "$claude_id" && -n "$codex_id" ]] && \
+          "$self" __relay "$codex_id" "$claude_id" Codex
+        ;;
+      p|P)
+        [[ -n "$claude_id" && -n "$codex_id" ]] && \
+          "$self" __broadcast "$claude_id" "$codex_id"
+        ;;
+      q|Q)
+        tmux kill-session -t "$session"
+        exit 0
+        ;;
+      *) : ;;
+    esac
+  done
+fi
+
+# ---- Usage / arg parsing ----------------------------------------------------
+usage() {
+  cat <<EOF
+Usage: council [-h|--help]
+
+Spawns a tmux session in the current directory for brainstorming with
+two AI CLIs side-by-side:
+  - top row:   single-keypress controller
+  - left:      claude --dangerously-skip-permissions
+  - right:     codex (with an auto-approve watcher window)
+
+Controller keys (focus the controller pane, then press):
+  A = relay Claude's latest output → Codex (ask Codex for its take)
+  S = relay Codex's latest output  → Claude
+  P = prompt for a question, broadcast to both panes
+  Q = kill everything
+
+Tip: horizontal split makes drag-copying across panes messy. Focus a pane
+and press Ctrl-b z to zoom it to full window for clean copying, then
+Ctrl-b z again to restore the split.
+
+Environment overrides:
+  COUNCIL_CLAUDE         claude command (default: claude --dangerously-skip-permissions)
+  COUNCIL_CODEX          codex  command (default: codex)
+  COUNCIL_APPROVAL_KEY   key sent to codex on permission prompt        (default: p)
+  COUNCIL_CAPTURE_LINES  lines captured when relaying a pane           (default: 500)
+  COUNCIL_CLAUDE_READY   extended regex that, once visible in claude's pane,
+                         means the input box is ready                  (default: "tab to cycle")
+  COUNCIL_CODEX_READY    same, for codex                               (default: "Context [0-9]+% left")
+  COUNCIL_READY_TIMEOUT  max seconds to wait for ready before pasting anyway (default: 180)
+
+Re-running in a directory with an existing session attaches to it.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    *) echo "council: unknown arg: $1" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+command -v tmux >/dev/null 2>&1 || { echo "council: tmux not installed" >&2; exit 1; }
+
+PROJ_DIR="$(pwd)"
+SELF="$(readlink -f "$0")"
+SESSION="council-$(basename "$PROJ_DIR" | tr -c '[:alnum:]_-' '_' | tr -s '_' | sed 's/^_//; s/_$//')"
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  if [[ -n "${TMUX:-}" ]]; then
+    exec tmux switch-client -t "$SESSION"
+  else
+    exec tmux attach-session -t "$SESSION"
+  fi
+fi
+
+CTRL_CMD=$(printf '%q __controller %q %q' "$SELF" "$SESSION" "$SELF")
+
+TERM_W=$(tput cols  2>/dev/null || echo 200)
+TERM_H=$(tput lines 2>/dev/null || echo 50)
+
+# Pane 0: controller (fills the window for now)
+CTRL_ID=$(tmux new-session -d -s "$SESSION" -n council -c "$PROJ_DIR" \
+            -x "$TERM_W" -y "$TERM_H" \
+            -P -F '#{pane_id}' "$CTRL_CMD")
+
+# Status bar
+tmux set-option -t "$SESSION" status on
+tmux set-option -t "$SESSION" status-position top
+tmux set-option -t "$SESSION" status-style "bg=default,fg=default"
+tmux set-option -t "$SESSION" status-left-length 80
+tmux set-option -t "$SESSION" status-left "#[fg=magenta,bold] council · $(basename "$PROJ_DIR") #[fg=default,nobold]"
+tmux set-option -t "$SESSION" status-right ""
+tmux set-option -t "$SESSION" window-status-format " "
+tmux set-option -t "$SESSION" window-status-current-format " "
+tmux set-option -t "$SESSION" status-justify left
+tmux set-option -t "$SESSION" mouse on
+tmux set-option -t "$SESSION" history-limit 200000
+
+CLAUDE_RUN=$(printf '%q __runner %q' "$SELF" "$CLAUDE_CMD")
+CODEX_RUN=$(printf  '%q __runner %q' "$SELF" "$CODEX_CMD")
+
+# Split a fat region below the controller (claude takes the whole lower region first).
+# Controller takes ~6 rows so the P prompt has room to render its multi-line input
+# without cramping; everything below the border belongs to the AI panes.
+WIN_H=$(tmux display-message -p -t "$CTRL_ID" '#{window_height}')
+LOWER_SIZE=$(( WIN_H > 10 ? WIN_H - 7 : WIN_H / 2 ))
+CLAUDE_ID=$(tmux split-window -t "$CTRL_ID" -v -l "$LOWER_SIZE" -c "$PROJ_DIR" \
+              -P -F '#{pane_id}' "$CLAUDE_RUN")
+
+# Split the claude pane horizontally to spawn codex to its right (50/50).
+CODEX_ID=$(tmux split-window -t "$CLAUDE_ID" -h -c "$PROJ_DIR" \
+             -P -F '#{pane_id}' "$CODEX_RUN")
+
+tmux set-environment -t "$SESSION" COUNCIL_CLAUDE_ID "$CLAUDE_ID"
+tmux set-environment -t "$SESSION" COUNCIL_CODEX_ID  "$CODEX_ID"
+
+# Background helpers: hidden tmux windows so they die with the session.
+WATCH_CMD=$(printf '%q __watch_codex %q' "$SELF" "$CODEX_ID")
+tmux new-window -d -t "$SESSION" -n watchdog "$WATCH_CMD"
+
+INIT_CMD=$(printf '%q __init_msg %q %q' "$SELF" "$CLAUDE_ID" "$CODEX_ID")
+tmux new-window -d -t "$SESSION" -n init "$INIT_CMD"
+
+tmux select-window -t "$SESSION:council"
+tmux select-pane   -t "$CTRL_ID"
+
+if [[ -n "${TMUX:-}" ]]; then
+  exec tmux switch-client -t "$SESSION"
+else
+  exec tmux attach-session -t "$SESSION"
+fi
