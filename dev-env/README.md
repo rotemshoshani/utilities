@@ -71,8 +71,11 @@ Or via environment variables:
 DEV_ENV_TOP="pnpm api:dev" DEV_ENV_BOTTOM="pnpm web:dev" dev-env
 ```
 
-Re-running `dev-env` in a directory that already has a session attaches
-to it instead of creating a new one.
+Re-running `dev-env` in a directory that already has a session kills that
+session and creates a fresh one. Before launch it also stops known dev-server
+processes (`npm run dev`, `next dev` / `next-server`, `npx convex dev`) whose
+working directory is the current project, including processes started from a
+regular terminal.
 
 ### Controller keys
 

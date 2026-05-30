@@ -17,16 +17,120 @@ set -euo pipefail
 TOP_CMD="${DEV_ENV_TOP:-npx convex dev}"
 BOT_CMD="${DEV_ENV_BOTTOM:-npm run dev}"
 
+canonical_dir() {
+  (cd "$1" && pwd -P)
+}
+
+process_cwd() {
+  local pid="$1"
+
+  if [[ -L "/proc/$pid/cwd" ]]; then
+    readlink -f "/proc/$pid/cwd" 2>/dev/null
+    return
+  fi
+
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -a -d cwd -Fn -p "$pid" 2>/dev/null | sed -n 's/^n//p' | head -n1
+  fi
+}
+
+process_command() {
+  ps -p "$1" -o args= 2>/dev/null || true
+}
+
+process_is_running() {
+  local stat
+  stat="$(ps -p "$1" -o stat= 2>/dev/null || true)"
+
+  [[ -n "$stat" && "$stat" != Z* ]]
+}
+
+is_project_dev_command() {
+  local cmd="$1"
+
+  case "$cmd" in
+    *"npm run dev"*|*"npx convex dev"*|*"convex dev"*|*"next dev"*|*"next-server"*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+cleanup_project_dev_processes() {
+  local project_dir
+  project_dir="$(canonical_dir "$1")"
+
+  local self_pid="$$"
+  local parent_pid="${PPID:-}"
+  local pid cmd cwd
+  local killed_pids=()
+
+  while IFS= read -r pid; do
+    pid="${pid//[[:space:]]/}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    [[ "$pid" == "$self_pid" || "$pid" == "$parent_pid" ]] && continue
+
+    cmd="$(process_command "$pid")"
+    [[ -n "$cmd" ]] || continue
+    is_project_dev_command "$cmd" || continue
+
+    cwd="$(process_cwd "$pid")"
+    [[ "$cwd" == "$project_dir" ]] || continue
+
+    printf 'dev-env: stopping existing dev process %s (%s)\n' "$pid" "$cmd" >&2
+    kill "$pid" 2>/dev/null || true
+    killed_pids+=("$pid")
+  done < <(ps -eo pid= 2>/dev/null)
+
+  for pid in "${killed_pids[@]}"; do
+    for _ in {1..20}; do
+      process_is_running "$pid" || break
+      sleep 0.1
+    done
+
+    if process_is_running "$pid"; then
+      printf 'dev-env: force-stopping existing dev process %s\n' "$pid" >&2
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  done
+}
+
+cleanup_tmux_session() {
+  local session="$1"
+
+  if tmux has-session -t "$session" 2>/dev/null; then
+    printf 'dev-env: killing existing tmux session %s\n' "$session" >&2
+    tmux kill-session -t "$session"
+  fi
+}
+
 # ---- Runner subcommand (wraps each worker pane) ------------------------------
 # Keeps the pane alive after the command exits/crashes, so the user can read
 # the final output and restart it via the controller. Avoids the race where
 # `remain-on-exit on` is set too late.
 if [[ "${1:-}" == "__runner" ]]; then
   shift
+  set +e
   bash -c "$1"
   ec=$?
   printf '\n\033[1;31m[exited code=%d]\033[0m  Use the controller above to restart.\n' "$ec"
-  exec sleep infinity
+  while true; do sleep 3600; done
+fi
+
+if [[ "${1:-}" == "__cleanup_project_dev_processes" ]]; then
+  shift
+  [[ $# -eq 1 ]] || { echo "__cleanup_project_dev_processes needs PROJECT_DIR" >&2; exit 1; }
+  cleanup_project_dev_processes "$1"
+  exit 0
+fi
+
+if [[ "${1:-}" == "__cleanup_tmux_session" ]]; then
+  shift
+  [[ $# -eq 1 ]] || { echo "__cleanup_tmux_session needs SESSION" >&2; exit 1; }
+  cleanup_tmux_session "$1"
+  exit 0
 fi
 
 usage() {
@@ -47,7 +151,7 @@ Options:
 
 Env: DEV_ENV_TOP, DEV_ENV_BOTTOM override the defaults.
 
-Re-running in a directory with an existing session attaches to it.
+Re-running in a directory with an existing session replaces it with a fresh one.
 EOF
 }
 
@@ -129,14 +233,10 @@ PROJ_DIR="$(pwd)"
 SELF="$(readlink -f "$0")"
 SESSION="dev-$(basename "$PROJ_DIR" | tr -c '[:alnum:]_-' '_' | tr -s '_' | sed 's/^_//; s/_$//')"
 
-# Attach if session already exists
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-  if [[ -n "${TMUX:-}" ]]; then
-    exec tmux switch-client -t "$SESSION"
-  else
-    exec tmux attach-session -t "$SESSION"
-  fi
-fi
+# Start fresh if the same project already has a dev-env session or loose dev
+# processes from a regular terminal.
+cleanup_tmux_session "$SESSION"
+cleanup_project_dev_processes "$PROJ_DIR"
 
 # Controller command (properly quoted for tmux's shell invocation)
 CTRL_CMD=$(printf '%q __controller %q' "$SELF" "$SESSION")
