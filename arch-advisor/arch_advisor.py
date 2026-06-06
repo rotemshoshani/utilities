@@ -18,6 +18,7 @@ from pathlib import Path
 
 DEFAULT_CONFIG = Path(__file__).with_name("config.json")
 STOP_NEXT_FLAG = "stop-next.flag"
+FINISH_SLEEP_FLAG = "finish-sleep.flag"
 TIMESTAMP_FORMAT = "%Y%m%d-%H%M%S"
 
 
@@ -112,7 +113,7 @@ def load_config(
         post_startup_wait_seconds=int(raw.get("post_startup_wait_seconds", 3)),
         capture_lines=int(raw.get("capture_lines", 400)),
         history_limit=int(raw.get("history_limit", 200000)),
-        session_name=str(raw.get("session_name", "sec-advisor")),
+        session_name=str(raw.get("session_name", "arch-advisor")),
         prompt=str(raw.get("prompt", "")),
         agents=agents,
     )
@@ -139,7 +140,7 @@ def build_run_queue(config: Config) -> list[RunItem]:
 
 
 def default_work_base_dir(project_dir: Path) -> Path:
-    return project_dir / ".planning" / "work" / "sec-advisor"
+    return project_dir / ".planning" / "work" / "arch-advisor"
 
 
 def make_runtime_dir(project_dir: Path, timestamp: str | None = None) -> Path:
@@ -152,7 +153,7 @@ def latest_runtime_dir(project_dir: Path) -> Path:
     candidates = sorted(path for path in base_dir.iterdir() if path.is_dir()) if base_dir.exists() else []
     candidates = [path for path in candidates if (path / "session.json").exists() or (path / "state.json").exists()]
     if not candidates:
-        raise SystemExit(f"no sec-advisor runs found under {base_dir}")
+        raise SystemExit(f"no arch-advisor runs found under {base_dir}")
     return candidates[-1]
 
 
@@ -164,6 +165,18 @@ def should_stop_after_current(runtime_dir: Path) -> bool:
     return (runtime_dir / STOP_NEXT_FLAG).exists()
 
 
+def should_finish_current_sleep(runtime_dir: Path) -> bool:
+    return (runtime_dir / FINISH_SLEEP_FLAG).exists()
+
+
+def consume_finish_current_sleep(runtime_dir: Path) -> bool:
+    flag = runtime_dir / FINISH_SLEEP_FLAG
+    if not flag.exists():
+        return False
+    flag.unlink(missing_ok=True)
+    return True
+
+
 def render_status(
     queue: list[RunItem],
     current_index: int | None,
@@ -172,7 +185,7 @@ def render_status(
     phase: str = "idle",
     remaining_seconds: int | None = None,
 ) -> str:
-    lines = ["sec-advisor", ""]
+    lines = ["arch-advisor", ""]
     for item in queue:
         if item.index in completed:
             marker = "V"
@@ -186,6 +199,7 @@ def render_status(
     if remaining_seconds is not None:
         lines.append(f"sleep remaining: {format_duration(remaining_seconds)}")
     lines.append(f"[S] stop after current: {'armed' if stop_after_current else 'off'}")
+    lines.append("[F] finish current sleep")
     lines.append("[Q] kill now")
     return "\n".join(lines)
 
@@ -227,7 +241,7 @@ def render_prompt(template: str, config: Config, item: RunItem) -> str:
         cycle=item.cycle,
         project_dir=str(config.project_dir),
         runtime_dir=str(config.runtime_dir),
-        audit_dir=str(config.runtime_dir),
+        review_dir=str(config.runtime_dir),
     )
 
 
@@ -329,7 +343,7 @@ class Controller:
 
     def paste_prompt(self, prompt: str) -> None:
         prompt_file = self.write_prompt_file(prompt)
-        buffer_name = f"sec-advisor-{os.getpid()}"
+        buffer_name = f"arch-advisor-{os.getpid()}"
         tmux("load-buffer", "-b", buffer_name, str(prompt_file))
         tmux("paste-buffer", "-d", "-b", buffer_name, "-t", self.worker_pane)
 
@@ -366,6 +380,11 @@ class Controller:
             self.remaining_seconds = remaining
             self.render()
             self.handle_keyboard()
+            if consume_finish_current_sleep(self.config.runtime_dir):
+                self.remaining_seconds = None
+                self.phase = f"{phase} finished early"
+                self.render()
+                return
             time.sleep(min(1, remaining))
 
     def handle_keyboard(self) -> None:
@@ -376,6 +395,9 @@ class Controller:
                 raise SystemExit(0)
             if key in {"s", "S"}:
                 (self.config.runtime_dir / STOP_NEXT_FLAG).write_text("1\n")
+                self.render()
+            if key in {"f", "F"}:
+                (self.config.runtime_dir / FINISH_SLEEP_FLAG).write_text("1\n")
                 self.render()
 
     def render(self) -> None:
@@ -388,6 +410,8 @@ class Controller:
                 "current_index": self.current_index,
                 "completed": sorted(self.completed),
                 "stop_after_current": should_stop_after_current(self.config.runtime_dir),
+                "finish_current_sleep": should_finish_current_sleep(self.config.runtime_dir),
+                "remaining_seconds": self.remaining_seconds,
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             },
         )
@@ -431,7 +455,7 @@ def sanitize_session_part(value: str) -> str:
 
 def start_session(args: argparse.Namespace) -> None:
     if shutil.which("tmux") is None:
-        raise SystemExit("sec-advisor: tmux is required")
+        raise SystemExit("arch-advisor: tmux is required")
 
     config_path = Path(args.config).expanduser().resolve()
     project_dir_override = Path(args.project_dir) if args.project_dir else None
@@ -447,6 +471,7 @@ def start_session(args: argparse.Namespace) -> None:
 
     config.runtime_dir.mkdir(parents=True, exist_ok=True)
     (config.runtime_dir / STOP_NEXT_FLAG).unlink(missing_ok=True)
+    (config.runtime_dir / FINISH_SLEEP_FLAG).unlink(missing_ok=True)
 
     session = args.session or f"{config.session_name}-{sanitize_session_part(config.project_dir.name)}"
     if tmux("has-session", "-t", session, check=False, capture=True).returncode == 0:
@@ -463,7 +488,7 @@ def start_session(args: argparse.Namespace) -> None:
         "-s",
         session,
         "-n",
-        "audit",
+        "review",
         "-c",
         str(config.project_dir),
         "-x",
@@ -494,7 +519,7 @@ def start_session(args: argparse.Namespace) -> None:
     tmux("set-option", "-t", session, "mouse", "on")
     tmux("set-option", "-t", session, "status", "on")
     tmux("set-option", "-t", session, "status-position", "top")
-    tmux("set-option", "-t", session, "status-left", f"#[fg=cyan,bold] sec-advisor {config.project_dir.name} ")
+    tmux("set-option", "-t", session, "status-left", f"#[fg=cyan,bold] arch-advisor {config.project_dir.name} ")
     tmux("set-option", "-t", session, "status-right", "")
 
     controller_cmd = (
@@ -553,6 +578,13 @@ def stop_next(args: argparse.Namespace) -> None:
     print(f"armed stop-after-current: {runtime_dir / STOP_NEXT_FLAG}")
 
 
+def finish_sleep(args: argparse.Namespace) -> None:
+    config = load_config_for_control(args)
+    runtime_dir = latest_runtime_dir(config.project_dir)
+    (runtime_dir / FINISH_SLEEP_FLAG).write_text("1\n")
+    print(f"armed finish-current-sleep: {runtime_dir / FINISH_SLEEP_FLAG}")
+
+
 def kill(args: argparse.Namespace) -> None:
     config = load_config_for_control(args)
     runtime_dir = latest_runtime_dir(config.project_dir)
@@ -571,12 +603,12 @@ def status(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="sec-advisor")
+    parser = argparse.ArgumentParser(prog="arch-advisor")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="path to config.json")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    run = sub.add_parser("run", help="start or attach to the tmux audit session")
-    run.add_argument("project_dir", nargs="?", default="", help="repo path to audit; overrides config.json project_dir")
+    run = sub.add_parser("run", help="start or attach to the tmux review session")
+    run.add_argument("project_dir", nargs="?", default="", help="repo path to review; overrides config.json project_dir")
     run.add_argument("--session", default="", help="override tmux session name")
     run.add_argument("--no-attach", action="store_true", help="create session without attaching")
     run.set_defaults(func=start_session)
@@ -595,6 +627,10 @@ def build_parser() -> argparse.ArgumentParser:
     stop = sub.add_parser("stop-next", help="finish current run, then stop")
     stop.add_argument("project_dir", nargs="?", default="", help="repo path; overrides config.json project_dir")
     stop.set_defaults(func=stop_next)
+
+    finish = sub.add_parser("finish-sleep", help="finish the current controller sleep immediately")
+    finish.add_argument("project_dir", nargs="?", default="", help="repo path; overrides config.json project_dir")
+    finish.set_defaults(func=finish_sleep)
 
     kill_cmd = sub.add_parser("kill", help="kill the tmux session now")
     kill_cmd.add_argument("project_dir", nargs="?", default="", help="repo path; overrides config.json project_dir")

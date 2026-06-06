@@ -2,7 +2,7 @@ import json
 import unittest
 from pathlib import Path
 
-from sec_advisor import (
+from arch_advisor import (
     RunItem,
     build_prompt_argument_command,
     build_run_queue,
@@ -11,13 +11,15 @@ from sec_advisor import (
     latest_runtime_dir,
     load_config,
     make_runtime_dir,
+    consume_finish_current_sleep,
     render_prompt,
     render_status,
+    should_finish_current_sleep,
     should_stop_after_current,
 )
 
 
-class SecAdvisorTests(unittest.TestCase):
+class ArchAdvisorTests(unittest.TestCase):
     def test_load_config_reads_defaults_and_agent_commands(self) -> None:
         with self.subTest():
             from tempfile import TemporaryDirectory
@@ -103,6 +105,7 @@ class SecAdvisorTests(unittest.TestCase):
         self.assertIn("codex #2 ... in progress", status)
         self.assertIn("claude #3 ... queued", status)
         self.assertIn("[S] stop after current: armed", status)
+        self.assertIn("[F] finish current sleep", status)
 
     def test_build_prompt_argument_command_reads_prompt_file_as_single_argument(self) -> None:
         command = build_prompt_argument_command("cdx", Path("/tmp/project prompt.txt"))
@@ -121,6 +124,23 @@ class SecAdvisorTests(unittest.TestCase):
             (runtime_dir / "stop-next.flag").write_text("1")
 
             self.assertTrue(should_stop_after_current(runtime_dir))
+
+    def test_finish_current_sleep_flag_is_consumed(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            runtime_dir = Path(raw_dir) / "runtime"
+            runtime_dir.mkdir()
+
+            self.assertFalse(should_finish_current_sleep(runtime_dir))
+            self.assertFalse(consume_finish_current_sleep(runtime_dir))
+
+            flag = runtime_dir / "finish-sleep.flag"
+            flag.write_text("1")
+
+            self.assertTrue(should_finish_current_sleep(runtime_dir))
+            self.assertTrue(consume_finish_current_sleep(runtime_dir))
+            self.assertFalse(flag.exists())
 
     def test_invalid_config_rejects_missing_agents(self) -> None:
         from tempfile import TemporaryDirectory
@@ -171,7 +191,7 @@ class SecAdvisorTests(unittest.TestCase):
                 )
             )
 
-            with patch("sec_advisor.Path.cwd", return_value=work_dir):
+            with patch("arch_advisor.Path.cwd", return_value=work_dir):
                 config = load_config(config_path)
 
             self.assertEqual(config.project_dir, work_dir)
@@ -184,29 +204,29 @@ class SecAdvisorTests(unittest.TestCase):
     def test_default_work_base_dir_lives_under_project_planning_work(self) -> None:
         self.assertEqual(
             default_work_base_dir(Path("/repo")),
-            Path("/repo/.planning/work/sec-advisor"),
+            Path("/repo/.planning/work/arch-advisor"),
         )
 
     def test_make_runtime_dir_uses_start_timestamp_under_work_base(self) -> None:
         self.assertEqual(
             make_runtime_dir(Path("/repo"), "20260526-175900"),
-            Path("/repo/.planning/work/sec-advisor/20260526-175900"),
+            Path("/repo/.planning/work/arch-advisor/20260526-175900"),
         )
 
-    def test_render_prompt_uses_timestamped_runtime_as_audit_dir(self) -> None:
+    def test_render_prompt_uses_timestamped_runtime_as_review_dir(self) -> None:
         from tempfile import TemporaryDirectory
 
         with TemporaryDirectory() as raw_dir:
             tmp_path = Path(raw_dir)
             config_path = tmp_path / "config.json"
             project_dir = tmp_path / "project"
-            runtime_dir = project_dir / ".planning/work/sec-advisor/20260526-175900"
+            runtime_dir = project_dir / ".planning/work/arch-advisor/20260526-175900"
             config_path.write_text(
                 json.dumps(
                     {
                         "project_dir": str(project_dir),
                         "agents": [{"name": "claude", "command": "claude"}],
-                        "prompt": "audit={audit_dir} runtime={runtime_dir}",
+                        "prompt": "review={review_dir} runtime={runtime_dir}",
                     }
                 )
             )
@@ -218,7 +238,7 @@ class SecAdvisorTests(unittest.TestCase):
                 RunItem(index=1, cycle=1, agent_name="claude", command="claude"),
             )
 
-            self.assertIn(f"audit={runtime_dir}", prompt)
+            self.assertIn(f"review={runtime_dir}", prompt)
             self.assertIn(f"runtime={runtime_dir}", prompt)
 
     def test_latest_runtime_dir_finds_newest_timestamped_run(self) -> None:
@@ -226,8 +246,8 @@ class SecAdvisorTests(unittest.TestCase):
 
         with TemporaryDirectory() as raw_dir:
             project_dir = Path(raw_dir) / "project"
-            older = project_dir / ".planning/work/sec-advisor/20260526-100000"
-            newer = project_dir / ".planning/work/sec-advisor/20260526-110000"
+            older = project_dir / ".planning/work/arch-advisor/20260526-100000"
+            newer = project_dir / ".planning/work/arch-advisor/20260526-110000"
             older.mkdir(parents=True)
             newer.mkdir(parents=True)
             (older / "session.json").write_text("{}")

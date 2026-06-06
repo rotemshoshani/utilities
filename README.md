@@ -4,6 +4,9 @@ A grab bag of small personal tools — terminal launchers, timers, and automatio
 
 ## Projects
 
+### [arch-advisor](arch-advisor/)
+Autonomous tmux runner for repeated AI architecture and performance review passes. It writes code-referenced findings and optimization plans around deployment, database/query patterns, caching, runtime hot paths, observability, and cost/performance tradeoffs.
+
 ### [cc-commands](cc-commands/)
 Source of truth for custom Claude Code slash commands (`/0-done`, `/0-sync`, `/0-teach`, etc.). Files here get copied into `~/.claude/commands/` via the sync command.
 
@@ -24,6 +27,9 @@ Browser-based interval/HIIT timer. Open `index.html`, import a CSV of exercises 
 
 ### [pomodoro-tui](pomodoro-tui/)
 Terminal Pomodoro timer (`pomopp`) that splits work into smaller chunks — `--work 10x5 --rest 10` runs five 10-minute cuts before a rest, so you only think about the next cut rather than a full session.
+
+### [prompt-queue](prompt-queue/)
+Tmux controller for feeding Codex a queue of prompts one at a time. Each prompt gets a fresh Codex process, a 45-minute run window, a captured worker pane, and then a clean worker restart before the next prompt.
 
 ### [statusline](statusline/)
 Custom Claude Code statusline (Node script) showing model, current task or GSD phase state, working directory, and context usage. `install.sh` wires it into Claude Code's settings.

@@ -1,0 +1,182 @@
+# prompt-queue
+
+Autonomous tmux runner for feeding a queue of prompts to Codex one at a time.
+
+It opens a tmux session with a controller pane and a worker pane. For each
+prompt, the controller starts a fresh Codex process, sends that prompt as the
+initial CLI prompt, waits up to 45 minutes, captures the worker pane, stops
+Codex by respawning the worker pane, and continues to the next prompt.
+
+All run artifacts are written under the target repo:
+
+```bash
+<project>/.planning/work/prompt-queue/<YYYYMMDD-HHMMSS>/
+```
+
+## Usage
+
+Edit `config.json`, then run:
+
+```bash
+./prompt-queue run
+```
+
+To build the prompt queue interactively:
+
+```bash
+./collect-prompts
+```
+
+For each prompt, paste the full text and finish it with a line containing only
+`::end`. When it asks for the next prompt, type `no more prompts`. The helper
+writes the prompts to `prompts/*.md` and updates `config.json` to reference
+those files.
+
+The config defines both the repo and the prompt queue:
+
+```jsonc
+{
+  "project_dir": "/absolute/path/to/target-repo",
+  "prompts": [
+    {
+      "name": "deployment",
+      "lines": [
+        "Review deployment config.",
+        "Write findings to .planning/reports/deployment.md."
+      ]
+    },
+    {
+      "name": "database",
+      "file": "prompts/database.md"
+    }
+  ]
+}
+```
+
+For long prompts, prefer files under this `prompt-queue` directory:
+
+```bash
+prompt-queue/
+  config.json
+  prompts/
+    database.md
+    frontend.md
+```
+
+Prompt file paths are resolved relative to `config.json`.
+
+Reattach:
+
+```bash
+./prompt-queue attach
+```
+
+Finish the current 45-minute sleep immediately and continue to capture/next
+prompt:
+
+```bash
+./prompt-queue finish-sleep
+```
+
+Finish the current prompt and stop before the next prompt:
+
+```bash
+./prompt-queue stop-next
+```
+
+Kill the tmux session immediately:
+
+```bash
+./prompt-queue kill
+```
+
+Print controller state:
+
+```bash
+./prompt-queue status
+```
+
+## Controller Keys
+
+Focus the controller pane and press:
+
+| Key | Action |
+| --- | --- |
+| `S` | Stop after the current prompt finishes |
+| `F` | Finish the current sleep immediately |
+| `Q` | Kill the tmux session now |
+
+## Config
+
+Edit `config.json`. This is the source of truth for:
+
+- `project_dir`: repo Codex should run in
+- `prompts`: ordered queue of inline prompt objects
+- `prompt_files`: ordered queue of prompt files, resolved relative to `config.json`
+
+The default command is `cdx`, which is expected to resolve through your shell
+alias. The worker pane starts an interactive Bash shell, so aliases from
+`~/.bashrc` are available.
+
+Readiness settings:
+
+- `ready_check_seconds`: seconds between worker-pane tail checks, default `60`
+- `ready_check_lines`: number of bottom rows to capture for each check, default `1`
+- `ready_markers`: marker text that means Codex is done, default `["Ready"]`
+- `block_marker`: exact output line that stops the queue, default `DO-NOT-PROCEED`
+- `block_check_lines`: recent non-empty rows to inspect after `Ready`, default `10`
+
+JSON does not allow raw multi-line string literals. Use one of these instead:
+
+```json
+{
+  "prompts": [
+    {
+      "name": "multi-line",
+      "lines": [
+        "First line.",
+        "Second line.",
+        "Third line."
+      ]
+    },
+    {
+      "name": "from-file",
+      "file": "prompts/from-file.md"
+    }
+  ],
+  "prompt_files": ["prompts/another-file.md"]
+}
+```
+
+During the Codex working phase, the controller samples the worker pane tail
+once per minute. If the last captured row contains `Ready`, it captures the
+run and advances immediately instead of waiting out the full 45 minutes.
+
+After `Ready` is detected, the controller also checks recent output for an
+exact line matching `DO-NOT-PROCEED`. If found, it writes the capture, records
+`blocked.json`, leaves the worker pane intact, and stops the queue before the
+next prompt.
+
+Readiness samples are written to:
+
+```bash
+<project>/.planning/work/prompt-queue/<YYYYMMDD-HHMMSS>/ready-checks/
+```
+
+`prompt_delivery: "argument_file"` writes each prompt to:
+
+```bash
+<project>/.planning/work/prompt-queue/<YYYYMMDD-HHMMSS>/prompts/
+```
+
+and launches Codex as:
+
+```bash
+cdx "$(cat <prompt-file>)"
+```
+
+Captures are written to:
+
+```bash
+<project>/.planning/work/prompt-queue/<YYYYMMDD-HHMMSS>/captures/
+```

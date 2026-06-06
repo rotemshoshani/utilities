@@ -1,0 +1,22 @@
+{
+  "project_dir": ".",
+  "session_name": "arch-advisor",
+  "num_runs": 3,
+  "run_seconds": 1500,
+  "startup_wait_seconds": 10,
+  "post_startup_wait_seconds": 3,
+  "capture_lines": 500,
+  "history_limit": 200000,
+  "agents": [
+    {
+      "name": "codex",
+      "command": "cdx",
+      "prompt_delivery": "argument_file"
+    },
+    {
+      "name": "claude",
+      "command": "claude --dangerously-skip-permissions --model default"
+    }
+  ],
+  "prompt": "You are running autonomous architecture and performance review pass {run_index} with {agent_name} against this repository: {project_dir}.\n\nGoal: find concrete opportunities to improve architecture, scalability, latency, throughput, reliability, operating cost, and maintainability. Focus on deployment topology, hosting/runtime configuration, database schema/query/index patterns, caching strategy, API/server hot paths, background jobs/queues, frontend bundle/render performance, data loading, third-party service usage, observability, CI/CD, and platform choices such as Convex, Vercel, Supabase, hosted auth/storage/database providers, CDNs, edge/serverless runtimes, webhooks, and SDKs.\n\nBefore starting, read any previous review files under {review_dir} if they exist. Briefly account for what was already covered, then try a different angle so this pass adds new value instead of repeating prior findings.\n\nWrite exactly two markdown files:\n- {review_dir}/run-{run_index}-{agent_name}-architecture-findings.md\n- {review_dir}/run-{run_index}-{agent_name}-optimization-plan.md\n\nThe findings file should prioritize concrete, code-referenced bottlenecks, architectural constraints, missing indexes/caches, deployment inefficiencies, reliability risks, and cost/performance tradeoffs. For each issue or option include impact, effort, confidence, affected files/services, and what evidence supports it. The optimization plan should order recommendations by ROI and dependency, with quick wins separated from larger migrations. If you find no strong opportunity in an area, say what you checked and why it looks acceptable. Do not make broad claims without code or configuration evidence."
+}

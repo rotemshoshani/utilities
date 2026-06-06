@@ -1,55 +1,61 @@
-# sec-advisor
+# arch-advisor
 
-Autonomous tmux runner for repeated AI security audit passes.
+Autonomous tmux runner for repeated AI architecture review passes.
 
 It opens a tmux session with a controller pane and a worker pane. The
 controller launches each configured agent command, waits for startup, sends the
-configured security prompt, sleeps for the configured run duration, captures the
+configured architecture/performance prompt, sleeps for the configured run duration, captures the
 last N rows, recycles the worker pane, and continues to the next run.
 
-All run artifacts are written under the audited repo:
+All run artifacts are written under the reviewed repo:
 
 ```bash
-<project>/.planning/work/sec-advisor/<YYYYMMDD-HHMMSS>/
+<project>/.planning/work/arch-advisor/<YYYYMMDD-HHMMSS>/
 ```
 
 ## Usage
 
 ```bash
-./sec-advisor run
+./arch-advisor run
 ```
 
-With the default config, `project_dir` is `"."`, so this audits the directory
+With the default config, `project_dir` is `"."`, so this reviews the directory
 you run the command from.
 
 Override the repo path from the command line:
 
 ```bash
-./sec-advisor run ~/projects/my-app
+./arch-advisor run ~/projects/my-app
 ```
 
 Reattach:
 
 ```bash
-./sec-advisor attach
+./arch-advisor attach
 ```
 
-Finish the current one-hour run and stop before the next run:
+Finish the current 25-minute run and stop before the next run:
 
 ```bash
-./sec-advisor stop-next
+./arch-advisor stop-next
+```
+
+Finish the controller's current sleep immediately and continue to the next step:
+
+```bash
+./arch-advisor finish-sleep
 ```
 
 Kill the tmux session immediately:
 
 ```bash
-./sec-advisor kill
+./arch-advisor kill
 ```
 
 Print controller state:
 
 ```bash
-./sec-advisor status
+./arch-advisor status
 ```
 
 ## Controller Keys
@@ -59,6 +65,7 @@ Focus the controller pane and press:
 | Key | Action |
 | --- | --- |
 | `S` | Stop after the current run finishes |
+| `F` | Finish the current sleep immediately |
 | `Q` | Kill the tmux session now |
 
 ## Config
@@ -73,19 +80,19 @@ command.
 Captures are written to:
 
 ```bash
-<project>/.planning/work/sec-advisor/<YYYYMMDD-HHMMSS>/captures/
+<project>/.planning/work/arch-advisor/<YYYYMMDD-HHMMSS>/captures/
 ```
 
-The prompt tells agents to write findings and fix plans directly into:
+The prompt tells agents to write architecture findings and optimization plans directly into:
 
 ```bash
-<project>/.planning/work/sec-advisor/<YYYYMMDD-HHMMSS>/
+<project>/.planning/work/arch-advisor/<YYYYMMDD-HHMMSS>/
 ```
 
-The default config runs five cycles of:
+The default config runs three cycles of:
 
-- `claude --dangerously-skip-permissions --model default`
 - `cdx`
+- `claude --dangerously-skip-permissions --model default`
 
 The Codex command is expected to resolve through your shell alias. The worker
 pane starts an interactive Bash shell, so aliases from `~/.bashrc` are available.
