@@ -20,8 +20,10 @@ Do not implement the plan in the target repo. Only prepare the queued executor p
 
 Use deterministic names such as `001-phase-name.md`, `002-phase-name.md`.
 
-4. Replace `prompt-queue/config.json` so:
-   - `project_dir` is the target repo absolute path.
+4. Write `prompt-queue/.env.local` so:
+   - `PROMPT_QUEUE_WORKDIR` is the target repo absolute path.
+5. Replace `prompt-queue/config.json` so:
+   - `project_dir` is `"${PROMPT_QUEUE_WORKDIR}"`.
    - `command` is `cdx`.
    - `prompt_delivery` is `argument_file`.
    - `run_seconds` is `2700`.
@@ -32,8 +34,8 @@ Use deterministic names such as `001-phase-name.md`, `002-phase-name.md`.
    - `block_check_lines` is `10`.
    - `prompts` references the files you wrote, in order.
    - `prompt_files` is `[]`.
-5. Validate the JSON with `python3 -m json.tool`.
-6. Report the prompt count, target repo, config path, and run command.
+6. Validate the JSON with `python3 -m json.tool`.
+7. Report the prompt count, target repo, env path, config path, and run command.
 
 Do not start the tmux queue unless the user explicitly asks you to run it.
 

@@ -1,5 +1,5 @@
 {
-  "project_dir": ".",
+  "project_dir": "${PROMPT_QUEUE_WORKDIR}",
   "session_name": "prompt-queue",
   "command": "cdx",
   "prompt_delivery": "argument_file",

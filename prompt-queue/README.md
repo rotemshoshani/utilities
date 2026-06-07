@@ -15,7 +15,7 @@ All run artifacts are written under the target repo:
 
 ## Usage
 
-Edit `config.json`, then run:
+Edit `.env.local` and `config.json`, then run:
 
 ```bash
 ./prompt-queue run
@@ -32,11 +32,17 @@ For each prompt, paste the full text and finish it with a line containing only
 writes the prompts to `prompts/*.md` and updates `config.json` to reference
 those files.
 
-The config defines both the repo and the prompt queue:
+`.env.local` defines the repo Codex should run in:
+
+```bash
+PROMPT_QUEUE_WORKDIR=/absolute/path/to/target-repo
+```
+
+`config.json` defines the prompt queue and reads that working directory:
 
 ```jsonc
 {
-  "project_dir": "/absolute/path/to/target-repo",
+  "project_dir": "${PROMPT_QUEUE_WORKDIR}",
   "prompts": [
     {
       "name": "deployment",
@@ -108,9 +114,10 @@ Focus the controller pane and press:
 
 ## Config
 
-Edit `config.json`. This is the source of truth for:
+Edit `.env.local` and `config.json`. They are the source of truth for:
 
-- `project_dir`: repo Codex should run in
+- `.env.local` `PROMPT_QUEUE_WORKDIR`: repo Codex should run in
+- `config.json` `project_dir`: normally `${PROMPT_QUEUE_WORKDIR}`
 - `prompts`: ordered queue of inline prompt objects
 - `prompt_files`: ordered queue of prompt files, resolved relative to `config.json`
 

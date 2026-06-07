@@ -1,4 +1,5 @@
 import json
+import os
 import unittest
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from prompt_queue import (
     consume_finish_current_sleep,
     default_work_base_dir,
     latest_runtime_dir,
+    load_env_file,
     load_config,
     make_runtime_dir,
     read_prompt_queue,
@@ -84,6 +86,48 @@ class PromptQueueTests(unittest.TestCase):
             config = load_config(config_path)
 
             self.assertEqual(config.project_dir, project_dir)
+
+    def test_project_dir_can_come_from_env_local(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            project_dir = tmp_path / "repo"
+            project_dir.mkdir()
+            config_path = tmp_path / "config.json"
+            env_path = tmp_path / ".env.local"
+            old_value = os.environ.get("PROMPT_QUEUE_WORKDIR")
+            try:
+                env_path.write_text(f"PROMPT_QUEUE_WORKDIR={project_dir}\n")
+                config_path.write_text(json.dumps({"project_dir": "${PROMPT_QUEUE_WORKDIR}", "prompts": ["prompt"]}))
+
+                config = load_config(config_path)
+
+                self.assertEqual(config.project_dir, project_dir)
+            finally:
+                if old_value is None:
+                    os.environ.pop("PROMPT_QUEUE_WORKDIR", None)
+                else:
+                    os.environ["PROMPT_QUEUE_WORKDIR"] = old_value
+
+    def test_load_env_file_parses_export_and_quotes(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            env_path = Path(raw_dir) / ".env.local"
+            old_value = os.environ.get("PROMPT_QUEUE_WORKDIR")
+            try:
+                env_path.write_text("export PROMPT_QUEUE_WORKDIR='/tmp/quoted repo'\n")
+
+                loaded = load_env_file(env_path)
+
+                self.assertEqual(loaded["PROMPT_QUEUE_WORKDIR"], "/tmp/quoted repo")
+                self.assertEqual(os.environ["PROMPT_QUEUE_WORKDIR"], "/tmp/quoted repo")
+            finally:
+                if old_value is None:
+                    os.environ.pop("PROMPT_QUEUE_WORKDIR", None)
+                else:
+                    os.environ["PROMPT_QUEUE_WORKDIR"] = old_value
 
     def test_prompt_queue_round_trips_to_json(self) -> None:
         from tempfile import TemporaryDirectory

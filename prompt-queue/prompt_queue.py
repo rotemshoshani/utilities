@@ -17,12 +17,14 @@ from pathlib import Path
 
 
 DEFAULT_CONFIG = Path(__file__).with_name("config.json")
+DEFAULT_ENV = Path(__file__).with_name(".env.local")
 STOP_NEXT_FLAG = "stop-next.flag"
 FINISH_SLEEP_FLAG = "finish-sleep.flag"
 TIMESTAMP_FORMAT = "%Y%m%d-%H%M%S"
 NO_MORE_PROMPTS = "no more prompts"
 DEFAULT_PROMPT_END_MARKER = "::end"
 DEFAULT_BLOCK_MARKER = "DO-NOT-PROCEED"
+WORKDIR_ENV_KEY = "PROMPT_QUEUE_WORKDIR"
 
 
 @dataclass(frozen=True)
@@ -69,19 +71,47 @@ def expand_project_path(value: str, base_dir: Path) -> Path:
     return path.resolve()
 
 
+def load_env_file(path: Path) -> dict[str, str]:
+    path = path.expanduser()
+    if not path.exists():
+        return {}
+
+    loaded: dict[str, str] = {}
+    for line_number, raw_line in enumerate(path.read_text().splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            raise ValueError(f"{path}:{line_number}: expected KEY=VALUE")
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"{path}:{line_number}: empty env key")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        loaded[key] = value
+        os.environ[key] = value
+    return loaded
+
+
 def load_config(
     path: Path = DEFAULT_CONFIG,
     project_dir_override: Path | None = None,
     runtime_dir_override: Path | None = None,
 ) -> Config:
     path = path.expanduser().resolve()
+    load_env_file(path.with_name(DEFAULT_ENV.name))
     raw = json.loads(path.read_text())
     base_dir = path.parent
 
+    raw_project_dir = str(raw.get("project_dir", f"${{{WORKDIR_ENV_KEY}}}"))
     project_dir = (
         project_dir_override.expanduser().resolve()
         if project_dir_override is not None
-        else expand_project_path(str(raw.get("project_dir", ".")), base_dir)
+        else expand_project_path(raw_project_dir, base_dir)
     )
     runtime_dir = runtime_dir_override if runtime_dir_override is not None else make_runtime_dir(project_dir)
     prompts = tuple(load_config_prompts(raw, base_dir))

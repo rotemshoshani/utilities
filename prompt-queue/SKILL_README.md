@@ -42,6 +42,7 @@ $queue-plan
 The skill should:
 
 - infer the target repo from the planning chat
+- write the target repo to `prompt-queue/.env.local`
 - write ordered prompt files under `prompt-queue/prompts/`
 - replace `prompt-queue/config.json`
 - configure `cdx`, `argument_file`, `Ready` detection, and `DO-NOT-PROCEED` blocking
@@ -90,12 +91,15 @@ Workflow:
 1. Infer the target repo from the planning chat; ask one concise question if unclear.
 2. Break the plan into ordered, self-contained executor prompts.
 3. Write one markdown file per prompt under prompt-queue/prompts/.
-4. Replace prompt-queue/config.json with project_dir, command "cdx",
-   prompt_delivery "argument_file", run_seconds 2700, ready_check_seconds 60,
-   ready_check_lines 1, ready_markers ["Ready"], block_marker "DO-NOT-PROCEED",
-   block_check_lines 10, prompts file references, and prompt_files [].
-5. Validate JSON with python3 -m json.tool.
-6. Report prompt count, target repo, config path, and run command.
+4. Write prompt-queue/.env.local with PROMPT_QUEUE_WORKDIR set to the target
+   repo absolute path.
+5. Replace prompt-queue/config.json with project_dir "${PROMPT_QUEUE_WORKDIR}",
+   command "cdx", prompt_delivery "argument_file", run_seconds 2700,
+   ready_check_seconds 60, ready_check_lines 1, ready_markers ["Ready"],
+   block_marker "DO-NOT-PROCEED", block_check_lines 10, prompts file
+   references, and prompt_files [].
+6. Validate JSON with python3 -m json.tool.
+7. Report prompt count, target repo, env path, config path, and run command.
 
 Every executor prompt must include target repo path, planning files to read,
 exact scope, constraints, non-goals, verification commands, and an instruction
