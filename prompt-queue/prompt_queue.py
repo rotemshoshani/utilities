@@ -25,6 +25,10 @@ NO_MORE_PROMPTS = "no more prompts"
 DEFAULT_PROMPT_END_MARKER = "::end"
 DEFAULT_BLOCK_MARKER = "DO-NOT-PROCEED"
 WORKDIR_ENV_KEY = "PROMPT_QUEUE_WORKDIR"
+DEFAULT_CODEX_COMMAND = "cdx"
+DEFAULT_CLAUDE_COMMAND = "cld"
+DEFAULT_CODEX_PROMPT_DELIVERY = "argument_file"
+DEFAULT_CLAUDE_PROMPT_DELIVERY = "paste"
 
 
 @dataclass(frozen=True)
@@ -128,12 +132,12 @@ def load_config(
         project_dir=project_dir,
         runtime_dir=runtime_dir,
         session_name=str(raw.get("session_name", "prompt-queue")),
-        command=str(raw.get("command", "cdx")),
+        command=str(raw.get("command", DEFAULT_CODEX_COMMAND)),
         run_seconds=int(raw.get("run_seconds", 2700)),
         startup_wait_seconds=int(raw.get("startup_wait_seconds", 10)),
         capture_lines=int(raw.get("capture_lines", 800)),
         history_limit=int(raw.get("history_limit", 200000)),
-        prompt_delivery=str(raw.get("prompt_delivery", "argument_file")),
+        prompt_delivery=str(raw.get("prompt_delivery", DEFAULT_CODEX_PROMPT_DELIVERY)),
         ready_check_seconds=int(raw.get("ready_check_seconds", 60)),
         ready_check_lines=int(raw.get("ready_check_lines", 1)),
         ready_markers=ready_marker_values,
@@ -148,6 +152,11 @@ def load_config_prompts(raw: dict[str, object], base_dir: Path) -> list[PromptIt
 
     for item in raw.get("prompts", []):
         if isinstance(item, str):
+            if looks_like_prompt_file_reference(item, base_dir):
+                raise ValueError(
+                    "config error: string entries in 'prompts' are sent as literal prompt text. "
+                    f"Move file path {item!r} to 'prompt_files' or use an object with a 'file' key."
+                )
             loaded.append((f"prompt-{len(loaded) + 1}", item, "config"))
         elif isinstance(item, dict):
             name = str(item.get("name", f"prompt-{len(loaded) + 1}"))
@@ -169,6 +178,17 @@ def load_config_prompts(raw: dict[str, object], base_dir: Path) -> list[PromptIt
         loaded.append((file_path.stem, file_path.read_text(), str(file_path)))
 
     return normalize_prompt_items(loaded)
+
+
+def looks_like_prompt_file_reference(value: str, base_dir: Path) -> bool:
+    stripped = value.strip()
+    if not stripped or any(ch.isspace() for ch in stripped):
+        return False
+    suffix = Path(stripped).suffix.lower()
+    if suffix not in {".md", ".txt", ".markdown"}:
+        return False
+    path = expand_path(stripped, base_dir)
+    return path.exists()
 
 
 def expand_path(value: str, base_dir: Path) -> Path:
@@ -258,6 +278,26 @@ def build_prompt_argument_command(command: str, prompt_file: Path) -> str:
     return f"{command} \"$(cat {sh_quote(str(prompt_file))})\""
 
 
+def apply_agent_override(config: Config, use_claude: bool) -> Config:
+    if not use_claude:
+        return config
+    return replace(
+        config,
+        command=DEFAULT_CLAUDE_COMMAND,
+        prompt_delivery=DEFAULT_CLAUDE_PROMPT_DELIVERY,
+    )
+
+
+def paste_settle_seconds(text_length: int) -> float:
+    if text_length < 500:
+        return 1.5
+    if text_length < 5000:
+        return 2.5
+    if text_length < 20000:
+        return 4.0
+    return 6.0
+
+
 def should_stop_after_current(runtime_dir: Path) -> bool:
     return (runtime_dir / STOP_NEXT_FLAG).exists()
 
@@ -316,10 +356,17 @@ def sanitize_name(value: str) -> str:
     return cleaned or "prompt"
 
 
-def tmux(*args: str, check: bool = True, capture: bool = False, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+def tmux(
+    *args: str,
+    check: bool = True,
+    capture: bool = False,
+    cwd: Path | None = None,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["tmux", *args],
         cwd=str(cwd) if cwd else None,
+        input=input_text,
         text=True,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
@@ -329,6 +376,13 @@ def tmux(*args: str, check: bool = True, capture: bool = False, cwd: Path | None
 
 def tmux_target_exists(target: str) -> bool:
     return tmux("display-message", "-p", "-t", target, "#{pane_id}", check=False, capture=True).returncode == 0
+
+
+def kill_tmux_session_if_exists(session: str) -> bool:
+    if tmux("has-session", "-t", session, check=False, capture=True).returncode != 0:
+        return False
+    tmux("kill-session", "-t", session, check=False)
+    return True
 
 
 def write_json(path: Path, value: object) -> None:
@@ -453,9 +507,8 @@ class Controller:
             self.phase = "sending prompt"
             self.render()
             self.paste_prompt(prompt_file)
-            self.send_key("Enter")
 
-        sleep_result = self.sleep_with_controls(self.config.run_seconds, "codex working", ready_item=item)
+        sleep_result = self.sleep_with_controls(self.config.run_seconds, "agent working", ready_item=item)
         capture_path = self.capture_run(item)
         if sleep_result == "blocked":
             self.phase = "blocked"
@@ -477,7 +530,7 @@ class Controller:
             self.sleep_with_controls(1, "fresh shell")
 
     def stop_worker(self) -> None:
-        self.phase = "stopping codex"
+        self.phase = "stopping agent"
         self.render()
         if tmux_target_exists(self.worker_pane):
             tmux("respawn-pane", "-k", "-t", self.worker_pane, "-c", str(self.config.project_dir))
@@ -512,8 +565,11 @@ class Controller:
 
     def paste_prompt(self, prompt_file: Path) -> None:
         buffer_name = f"prompt-queue-{os.getpid()}"
-        tmux("load-buffer", "-b", buffer_name, str(prompt_file))
-        tmux("paste-buffer", "-d", "-b", buffer_name, "-t", self.worker_pane)
+        prompt_text = prompt_file.read_text().rstrip("\n")
+        tmux("load-buffer", "-b", buffer_name, "-", input_text=prompt_text)
+        tmux("paste-buffer", "-d", "-p", "-b", buffer_name, "-t", self.worker_pane)
+        time.sleep(paste_settle_seconds(len(prompt_text)))
+        self.send_key("Enter")
 
     def capture_run(self, item: RunItem) -> Path:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -714,7 +770,7 @@ def start_session(args: argparse.Namespace) -> None:
         raise SystemExit("prompt-queue: tmux is required")
 
     config_path = Path(args.config).expanduser().resolve()
-    initial_config = load_config(config_path)
+    initial_config = apply_agent_override(load_config(config_path), args.cld)
     if not initial_config.prompts:
         raise SystemExit("prompt-queue: configure prompts or prompt_files in config.json")
 
@@ -733,9 +789,7 @@ def start_session(args: argparse.Namespace) -> None:
     write_prompt_queue(queue_file, config.prompts)
 
     session = args.session or f"{config.session_name}-{sanitize_name(config.project_dir.name)}"
-    if tmux("has-session", "-t", session, check=False, capture=True).returncode == 0:
-        attach_session(session)
-        return
+    kill_tmux_session_if_exists(session)
 
     term_w = str(shutil.get_terminal_size((200, 50)).columns)
     term_h = str(shutil.get_terminal_size((200, 50)).lines)
@@ -803,6 +857,8 @@ def start_session(args: argparse.Namespace) -> None:
             "queue_file": str(queue_file),
             "started_at": start_stamp,
             "prompt_count": len(config.prompts),
+            "command": config.command,
+            "prompt_delivery": config.prompt_delivery,
         },
     )
     if not args.no_attach:
@@ -915,6 +971,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="start or attach to the tmux prompt queue session")
     run.add_argument("--session", default="", help="override tmux session name")
     run.add_argument("--no-attach", action="store_true", help="create session without attaching")
+    run.add_argument("--cld", action="store_true", help="run Claude via cld and paste prompts instead of Codex")
     run.set_defaults(func=start_session)
 
     controller = sub.add_parser("__controller")

@@ -1,11 +1,11 @@
 # prompt-queue
 
-Autonomous tmux runner for feeding a queue of prompts to Codex one at a time.
+Autonomous tmux runner for feeding a queue of prompts to an agent one at a time.
 
 It opens a tmux session with a controller pane and a worker pane. For each
-prompt, the controller starts a fresh Codex process, sends that prompt as the
+prompt, the controller starts a fresh agent process, sends that prompt as the
 initial CLI prompt, waits up to 45 minutes, captures the worker pane, stops
-Codex by respawning the worker pane, and continues to the next prompt.
+the agent by respawning the worker pane, and continues to the next prompt.
 
 All run artifacts are written under the target repo:
 
@@ -21,6 +21,16 @@ Edit `.env.local` and `config.json`, then run:
 ./prompt-queue run
 ```
 
+By default this runs Codex through `cdx`. To run the same queue through Claude
+instead, using `cld` and interactive paste delivery:
+
+```bash
+./prompt-queue run --cld
+```
+
+Starting a run kills the existing tmux session for this prompt queue if one is
+already present, then creates a fresh session.
+
 To build the prompt queue interactively:
 
 ```bash
@@ -32,7 +42,7 @@ For each prompt, paste the full text and finish it with a line containing only
 writes the prompts to `prompts/*.md` and updates `config.json` to reference
 those files.
 
-`.env.local` defines the repo Codex should run in:
+`.env.local` defines the repo the agent should run in:
 
 ```bash
 PROMPT_QUEUE_WORKDIR=/absolute/path/to/target-repo
@@ -116,20 +126,21 @@ Focus the controller pane and press:
 
 Edit `.env.local` and `config.json`. They are the source of truth for:
 
-- `.env.local` `PROMPT_QUEUE_WORKDIR`: repo Codex should run in
+- `.env.local` `PROMPT_QUEUE_WORKDIR`: repo the agent should run in
 - `config.json` `project_dir`: normally `${PROMPT_QUEUE_WORKDIR}`
 - `prompts`: ordered queue of inline prompt objects
 - `prompt_files`: ordered queue of prompt files, resolved relative to `config.json`
 
 The default command is `cdx`, which is expected to resolve through your shell
-alias. The worker pane starts an interactive Bash shell, so aliases from
-`~/.bashrc` are available.
+alias. `./prompt-queue run --cld` overrides the command to `cld` and uses
+tmux bracketed paste followed by Enter to submit each prompt. The worker pane
+starts an interactive Bash shell, so aliases from `~/.bashrc` are available.
 
 Readiness settings:
 
 - `ready_check_seconds`: seconds between worker-pane tail checks, default `60`
 - `ready_check_lines`: number of bottom rows to capture for each check, default `1`
-- `ready_markers`: marker text that means Codex is done, default `["Ready"]`
+- `ready_markers`: marker text that means the agent is done, default `["Ready"]`
 - `block_marker`: exact output line that stops the queue, default `DO-NOT-PROCEED`
 - `block_check_lines`: recent non-empty rows to inspect after `Ready`, default `10`
 
@@ -155,7 +166,7 @@ JSON does not allow raw multi-line string literals. Use one of these instead:
 }
 ```
 
-During the Codex working phase, the controller samples the worker pane tail
+During the agent working phase, the controller samples the worker pane tail
 once per minute. If the last captured row contains `Ready`, it captures the
 run and advances immediately instead of waiting out the full 45 minutes.
 

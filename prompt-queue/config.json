@@ -1,10 +1,8 @@
 {
   "project_dir": "${PROMPT_QUEUE_WORKDIR}",
-  "session_name": "prompt-queue",
   "command": "cdx",
   "prompt_delivery": "argument_file",
   "run_seconds": 2700,
-  "startup_wait_seconds": 10,
   "ready_check_seconds": 60,
   "ready_check_lines": 1,
   "ready_markers": [
@@ -12,8 +10,12 @@
   ],
   "block_marker": "DO-NOT-PROCEED",
   "block_check_lines": 10,
-  "capture_lines": 800,
-  "history_limit": 200000,
   "prompts": [],
-  "prompt_files": []
+  "prompt_files": [
+    "prompts/001-task-scheduling-primitives.md",
+    "prompts/002-call-visit-next-action-wiring.md",
+    "prompts/003-task-reminder-schedules.md",
+    "prompts/004-next-action-wizard-ui.md",
+    "prompts/005-compatibility-cleanup-verification.md"
+  ]
 }

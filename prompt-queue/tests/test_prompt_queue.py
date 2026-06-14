@@ -2,19 +2,25 @@ import json
 import os
 import unittest
 from pathlib import Path
+from subprocess import CompletedProcess
+from unittest import mock
 
+import prompt_queue
 from prompt_queue import (
     Controller,
     RunItem,
+    apply_agent_override,
     build_prompt_argument_command,
     build_run_queue,
     build_worker_cd_command,
     consume_finish_current_sleep,
     default_work_base_dir,
+    kill_tmux_session_if_exists,
     latest_runtime_dir,
     load_env_file,
     load_config,
     make_runtime_dir,
+    paste_settle_seconds,
     read_prompt_queue,
     render_status,
     should_finish_current_sleep,
@@ -86,6 +92,28 @@ class PromptQueueTests(unittest.TestCase):
             config = load_config(config_path)
 
             self.assertEqual(config.project_dir, project_dir)
+
+    def test_prompts_string_that_points_to_file_raises_clear_error(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            prompts_dir = tmp_path / "prompts"
+            prompts_dir.mkdir()
+            (prompts_dir / "001-work.md").write_text("actual prompt body")
+            config_path = tmp_path / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "project_dir": "/tmp/project",
+                        "prompts": ["prompts/001-work.md"],
+                        "prompt_files": [],
+                    }
+                )
+            )
+
+            with self.assertRaisesRegex(ValueError, "Move file path 'prompts/001-work.md' to 'prompt_files'"):
+                load_config(config_path)
 
     def test_project_dir_can_come_from_env_local(self) -> None:
         from tempfile import TemporaryDirectory
@@ -202,6 +230,40 @@ class PromptQueueTests(unittest.TestCase):
                 ],
             )
 
+    def test_cld_override_reuses_queue_with_claude_command_and_paste_delivery(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            config_path = Path(raw_dir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "command": "cdx",
+                        "prompt_delivery": "argument_file",
+                        "prompts": [{"name": "first", "text": "Prompt one"}],
+                    }
+                )
+            )
+
+            config = apply_agent_override(load_config(config_path), use_claude=True)
+            queue = build_run_queue(config)
+
+            self.assertEqual(config.command, "cld")
+            self.assertEqual(config.prompt_delivery, "paste")
+            self.assertEqual([(item.prompt_name, item.command, item.prompt_delivery) for item in queue], [
+                ("first", "cld", "paste")
+            ])
+
+    def test_agent_override_leaves_default_codex_config_unchanged(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            config_path = Path(raw_dir) / "config.json"
+            config_path.write_text(json.dumps({"command": "cdx", "prompt_delivery": "argument_file", "prompts": ["one"]}))
+            config = load_config(config_path)
+
+            self.assertIs(apply_agent_override(config, use_claude=False), config)
+
     def test_render_status_marks_done_in_progress_pending_and_stop_next(self) -> None:
         queue = [
             RunItem(index=1, prompt_name="first", prompt_text="one", prompt_source="test", command="cdx"),
@@ -256,6 +318,68 @@ class PromptQueueTests(unittest.TestCase):
         command = build_prompt_argument_command("cdx", Path("/tmp/project prompt.txt"))
 
         self.assertEqual(command, 'cdx "$(cat \'/tmp/project prompt.txt\')"')
+
+    def test_paste_settle_seconds_scales_by_prompt_size(self) -> None:
+        self.assertEqual(paste_settle_seconds(499), 1.5)
+        self.assertEqual(paste_settle_seconds(500), 2.5)
+        self.assertEqual(paste_settle_seconds(5000), 4.0)
+        self.assertEqual(paste_settle_seconds(20000), 6.0)
+
+    def test_paste_prompt_uses_tmux_bracketed_paste_and_sends_enter(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            config_path = tmp_path / "config.json"
+            config_path.write_text(json.dumps({"project_dir": "/tmp/project", "prompts": ["prompt"]}))
+            config = load_config(config_path, runtime_dir_override=tmp_path / "runtime")
+            controller = Controller(config, "session", "%1")
+            prompt_file = tmp_path / "prompt.txt"
+            prompt_file.write_text("hello\n\n")
+            calls: list[tuple[tuple[str, ...], str | None]] = []
+
+            def fake_tmux(*args: str, **kwargs: object) -> CompletedProcess[str]:
+                calls.append((args, kwargs.get("input_text") if isinstance(kwargs.get("input_text"), str) else None))
+                return CompletedProcess(["tmux", *args], 0, "", "")
+
+            with mock.patch.object(prompt_queue, "tmux", side_effect=fake_tmux), mock.patch.object(prompt_queue.time, "sleep"):
+                controller.paste_prompt(prompt_file)
+
+            self.assertEqual(calls[0], (("load-buffer", "-b", mock.ANY, "-"), "hello"))
+            self.assertEqual(calls[1][0][:6], ("paste-buffer", "-d", "-p", "-b", mock.ANY, "-t"))
+            self.assertEqual(calls[1][0][6:], ("%1",))
+            self.assertEqual(calls[2], (("send-keys", "-t", "%1", "Enter"), None))
+
+    def test_kill_tmux_session_if_exists_kills_existing_session(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def fake_tmux(*args: str, **kwargs: object) -> CompletedProcess[str]:
+            calls.append(args)
+            if args[:1] == ("has-session",):
+                return CompletedProcess(["tmux", *args], 0, "", "")
+            return CompletedProcess(["tmux", *args], 0, "", "")
+
+        with mock.patch.object(prompt_queue, "tmux", side_effect=fake_tmux):
+            killed = kill_tmux_session_if_exists("prompt-queue-project")
+
+        self.assertTrue(killed)
+        self.assertEqual(calls, [
+            ("has-session", "-t", "prompt-queue-project"),
+            ("kill-session", "-t", "prompt-queue-project"),
+        ])
+
+    def test_kill_tmux_session_if_exists_skips_missing_session(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def fake_tmux(*args: str, **kwargs: object) -> CompletedProcess[str]:
+            calls.append(args)
+            return CompletedProcess(["tmux", *args], 1, "", "")
+
+        with mock.patch.object(prompt_queue, "tmux", side_effect=fake_tmux):
+            killed = kill_tmux_session_if_exists("prompt-queue-project")
+
+        self.assertFalse(killed)
+        self.assertEqual(calls, [("has-session", "-t", "prompt-queue-project")])
 
     def test_ready_marker_blocks_on_exact_marker_line_only(self) -> None:
         from tempfile import TemporaryDirectory

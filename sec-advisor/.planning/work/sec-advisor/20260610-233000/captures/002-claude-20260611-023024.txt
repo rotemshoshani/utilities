@@ -1,0 +1,267 @@
+[rshoshani@home sec-advisor]$ cd -- '/home/rshoshani/projects/utilities/sec-advisor'
+[rshoshani@home sec-advisor]$ claude --dangerously-skip-permissions --model default
+ ▐▛███▜▌   Claude Code v2.1.170
+▝▜█████▛▘  Opus 4.8 (1M context) with high effort · Claude Max
+  ▘▘ ▝▝    ~/projects/utilities/sec-advisor
+
+ ⚠ 1 setup issue: MCP · /doctor                                                              
+                                                                                       
+ ▎ Meet Fable 5, our newest model for complex, long-running work. Try anytime with /model.
+ ▎ Included in your plan limits until Jun 22, then switch to usage credits to continue.      
+
+❯ You are running autonomous security audit pass 1 with claude against this repository:      
+  /home/rshoshani/projects/utilities/sec-advisor.                                            
+                                                                                             
+  Goal: find real security problems, weak assumptions, missing access gates, auth/authz      
+  mistakes, unsafe networking or deployment behavior, dependency/package risks,              
+  secret-handling issues, and weaknesses that are commonly introduced by AI-generated code.  
+  When relevant to the project, also check for issues in third-party services, platforms,    
+  and dependencies such as Convex, Vercel, Supabase, hosted auth/storage/database providers, 
+  SDKs, webhooks, CI/CD integrations, and deployment configuration.                          
+                                                                                             
+  Before starting, read any previous audit files under                                       
+  /home/rshoshani/projects/utilities/sec-advisor/.planning/work/sec-advisor/20260610-233000  
+  if they exist. Briefly account for what was already covered, then try a different angle so 
+  this pass adds new value instead of repeating prior findings.                              
+                                                                                             
+  Write exactly two markdown files:                                                          
+  - /home/rshoshani/projects/utilities/sec-advisor/.planning/work/sec-advisor/20260610-23300 
+  0/run-1-claude-findings.md                                                                 
+  - /home/rshoshani/projects/utilities/sec-advisor/.planning/work/sec-advisor/20260610-23300 
+  0/run-1-claude-fix-plan.md                                                                 
+                                                                                             
+  The findings file should prioritize concrete, code-referenced issues with severity,        
+  exploitability, affected files, and confidence. The fix-plan file should give an           
+  actionable remediation plan ordered by risk and dependency. If you find no strong issue in 
+  an area, say what you checked and why it looks acceptable. Do not make broad claims        
+  without code evidence.                                                                     
+
+● I'll start by reading prior audit files and exploring the repo structure.
+
+  Listed 2 directories (ctrl+o to expand)                                                    
+
+● No prior findings files — this is pass 1. Let me read the source.
+
+  Read 4 files (ctrl+o to expand)                            
+
+● Let me check tests and look for any other relevant files.
+
+● Bash(ls -la tests/ && echo "===GIT TRACKED===" && git ls-files | head -50 && echo
+      "===GITIGNORE===" && cat .gitignore 2>/dev/null || echo "no gitignore")
+  ⎿  total 12                                                                                
+     drwxr-xr-x. 1 rshoshani rshoshani   60 Jun 10 15:15 .
+     drwxr-xr-x. 1 rshoshani rshoshani  140 Jun 10 23:30 ..                                  
+     … +10 lines (ctrl+o to expand)                                                        
+
+● Bash(wc -l tests/*.py 2>/dev/null; echo "---"; git log --oneline -10 -- . 2>/dev/null; echo
+      "---grep secrets---"; grep -rniE "token|secret|api[_-]?key|password|crede…)
+  ⎿  240 tests/test_sec_advisor.py                                                           
+     ---
+     759a0c6 [PC/2026-06-06] add advisor and prompt queue utilities                          
+     … +3 lines (ctrl+o to expand)                                      
+
+● I have enough. No .gitignore — notable. Let me write the two audit files.
+
+● Write(.planning/work/sec-advisor/20260610-233000/run-1-claude-findings.md)                 
+  ⎿  Wrote 231 lines to
+     .planning/work/sec-advisor/20260610-233000/run-1-claude-findings.md                     
+       2 # sec-advisor — Security Audit Findings (run 1, claude)
+       3 Date: 2026-06-10                                                                    
+       4 Auditor: claude (autonomous pass 1)                            
+       5 Scope: `sec_advisor.py`, `config.json`, `sec-advisor`, `README.md`, `tests/te       
+         st_sec_advisor.py`                                             
+       6                                       
+       7 ## Prior coverage
+       8
+       9 No previous `run-*-findings.md` files existed under the runtime dir. Only
+      10 controller/session/state metadata was present. This is a genuine first pass —
+     … +235 lines (ctrl+o to expand)
+
+● Write(.planning/work/sec-advisor/20260610-233000/run-1-claude-fix-plan.md)
+  ⎿  Wrote 99 lines to
+     .planning/work/sec-advisor/20260610-233000/run-1-claude-fix-plan.md                     
+      1 # sec-advisor — Fix Plan (run 1, claude)
+      2                                                                                      
+      3 Ordered by risk and dependency. Each item references the finding it closes.
+      4                                                                                      
+      5 ## Tier 0 — Containment (closes F1, F8). Do first; everything else is secondar
+        y.                                     
+      6
+      7 The tool's job is to run an unsandboxed autonomous agent over untrusted code.
+      8 You cannot make that safe with input validation; you make it safe with
+      9 confinement. Pick the strongest option you can operate:
+     … +89 lines (ctrl+o to expand)
+
+● Audit pass 1 done. Wrote both files.
+
+  Findings written to run-1-claude-findings.md (+ fix plan). No prior findings existed —     
+  genuine first pass.
+
+  Top issues:                                                           
+                                               
+  - F1 (HIGH): Tool's core design — claude --dangerously-skip-permissions runs unattended (90
+  min × 6) reading untrusted repo content. Repo files = untrusted input → prompt-injection →
+  RCE with no gate, no sandbox, full user privileges. config.json:13.                        
+  - F8 (MEDIUM): No egress/filesystem confinement — turns F1 from "bad command" into
+  "exfiltrate ~/.ssh, ~/.aws, tokens."                                                       
+  - F2 (MEDIUM): Captures (capture_run, last 500 pane rows verbatim) + last-prompt.txt
+  written into audited repo with no .gitignore → secrets harvested during audit can get      
+  committed.                                                            
+  - F3 (LOW/MED): Artifacts written at default umask (often 0644) → readable by other local
+  users.                                                                                     
+  - F5/F6/F7 (LOW): config+~/.bashrc are executable TCB; str.format template surface;
+  latest_runtime_dir picks lexicographic-last → can kill wrong session.                      
+
+[rshoshani@home sec-advisor]$ cd -- '/home/rshoshani/projects/utilities/sec-advisor'
+[rshoshani@home sec-advisor]$ claude --dangerously-skip-permissions --model default
+ ▐▛███▜▌   Claude Code v2.1.172                                                              
+▝▜█████▛▘  Opus 4.8 (1M context) with high effort · Claude Max                               
+  ▘▘ ▝▝    ~/projects/utilities/sec-advisor                                                  
+
+ ⚠ 1 setup issue: MCP · /doctor                                                              
+                                                                                             
+ ▎ Meet Fable 5, our newest model for complex, long-running work. Try anytime with /model.
+ ▎ Included in your plan limits until Jun 22, then switch to usage credits to continue.      
+
+❯ You are running autonomous security audit pass 2 with claude against this repository:      
+  /home/rshoshani/projects/utilities/sec-advisor.                                            
+                                                                                             
+  Goal: find real security problems, weak assumptions, missing access gates, auth/authz      
+  mistakes, unsafe networking or deployment behavior, dependency/package risks,              
+  secret-handling issues, and weaknesses that are commonly introduced by AI-generated code.  
+  When relevant to the project, also check for issues in third-party services, platforms,    
+  and dependencies such as Convex, Vercel, Supabase, hosted auth/storage/database providers, 
+  SDKs, webhooks, CI/CD integrations, and deployment configuration.                          
+                                                                                             
+  Before starting, read any previous audit files under                                       
+  /home/rshoshani/projects/utilities/sec-advisor/.planning/work/sec-advisor/20260610-233000  
+  if they exist. Briefly account for what was already covered, then try a different angle so 
+  this pass adds new value instead of repeating prior findings.                              
+                                                                                             
+  Write exactly two markdown files:                                                          
+  - /home/rshoshani/projects/utilities/sec-advisor/.planning/work/sec-advisor/20260610-23300 
+  0/run-2-claude-findings.md                                                                 
+  - /home/rshoshani/projects/utilities/sec-advisor/.planning/work/sec-advisor/20260610-23300 
+  0/run-2-claude-fix-plan.md                                                                 
+                                                                                             
+  The findings file should prioritize concrete, code-referenced issues with severity,        
+  exploitability, affected files, and confidence. The fix-plan file should give an           
+  actionable remediation plan ordered by risk and dependency. If you find no strong issue in 
+  an area, say what you checked and why it looks acceptable. Do not make broad claims        
+  without code evidence.                                                                     
+
+● Starting audit. First read previous findings + explore repo.
+
+  Read 6 files, listed 1 directory (ctrl+o to expand)                                        
+
+● Bash(cat /home/rshoshani/projects/utilities/sec-advisor/tests/test_sec_advisor.py          
+      2>/dev/null | head -120; echo "---GITFILES---"; git ls-files | head -50; echo "---G…)
+  ⎿  import json                                                                           
+     import unittest
+     from pathlib import Path                            
+     … +125 lines (ctrl+o to expand)
+
+● Enough evidence. Prior pass (F1–F8) covered: dangerous-skip-permissions RCE, no egress/fs  
+  confinement, artifacts un-gitignored, world-readable perms, config-as-code, str.format
+  surface, $(cat) delivery safety, lexicographic latest_runtime_dir.                         
+
+  Pass-2 angle: untrusted target repo as an active attacker against the orchestrator's own   
+  control plane and filesystem boundary — not yet covered. Writing both files.
+
+● Write(.planning/work/sec-advisor/20260610-233000/run-2-claude-findings.md)
+  ⎿  Wrote 247 lines to                        
+     .planning/work/sec-advisor/20260610-233000/run-2-claude-findings.md                     
+       2 # sec-advisor — Security Audit Findings (run 2, claude)
+       3 Date: 2026-06-11                                                                    
+       4 Auditor: claude (autonomous pass 2)                            
+       5 Scope: `sec_advisor.py`, `config.json`, `sec-advisor`, `README.md`, `tests/te       
+         st_sec_advisor.py`                                             
+       7 ## Prior coverage (run 1)             
+       8
+       9 Run 1 found, in order: F1 unsandboxed `--dangerously-skip-permissions` agent
+         vs
+      10 untrusted repo (HIGH/RCE), F8 no egress/fs confinement (MEDIUM), F2 artifacts
+     … +260 lines (ctrl+o to expand)
+
+● Now the fix plan.                     
+
+● Write(.planning/work/sec-advisor/20260610-233000/run-2-claude-fix-plan.md)                 
+  ⎿  Wrote 108 lines to
+     .planning/work/sec-advisor/20260610-233000/run-2-claude-fix-plan.md                     
+       2 # sec-advisor — Fix Plan (run 2, claude)
+       3 Ordered by risk and dependency. Each item closes a run-2 finding (N1–N5). The       
+         se                                                             
+       4 complement, not replace, run-1's Tier 0 containment (still the top priority).       
+       5                                                                
+       7 state inside the untrusted target repo.** The cleanest structural fix is to m
+         ove
+       8 runtime/control state *out of the audited tree* entirely. Items 1 and 2 below
+       9 offer that as the preferred path, with point fixes if the on-disk layout must
+      10 stay.
+     … +99 lines (ctrl+o to expand)
+
+● Pass 2 done. Two files written.        
+
+  New angle this pass                                                                        
+
+  Run 1 framed risk as "the launched agent does something bad." Pass 2 inverts it: the       
+  untrusted target repo is an active attacker against the orchestrator's own control plane 
+  and write boundary — because sec_advisor.py both reads control state from and writes       
+  artifacts into project_dir/.planning/, which the repo author fully controls.
+                                               
+  Findings
+
+  ID: N1               
+  Sev: MEDIUM          
+  Issue: latest_runtime_dir/read_session trust session.json inside the untrusted repo.
+    Malicious repo plants .planning/work/sec-advisor/99999999-999999/session.json (sorts last
+
+    → always picked) → kill runs tmux kill-session -t <attacker value> (kill operator's main 
+    session), attach redirects client into attacker-named pane.
+    sec_advisor.py:150-156,556-561,591-593                                                   
+  ────────────────────────────────────────                               
+  ID: N2                                                                                     
+  Sev: MEDIUM
+  Issue: Artifact path joined under repo, mkdir(exist_ok=True) + write_text follow symlinks  
+    (no O_NOFOLLOW). Repo ships .planning as symlink → controller writes 
+    controller.json/state.json/last-prompt.txt/captures outside the repo. Write-side boundary
+
+    escape. :145-147,251,325-328,336-354
+  ────────────────────────────────────────
+  ID: N3                                                                                     
+  Sev: LOW
+  Issue: Session name = sec-advisor-<basename>. Same-basename repos collide → run silently   
+    attaches to wrong audit; predictable name allows local pre-seed hijack. :427-429,451-454
+  ────────────────────────────────────────     
+  ID: N4                                                                                     
+  Sev: LOW
+  Issue: __controller is reachable CLI; takes free-form --worker-pane and send-keys the      
+    dangerous agent command to any named pane. No ownership check. :584-589,319-323
+  ────────────────────────────────────────     
+  ID: N5                                                                                     
+  Sev: INFO
+  Issue: Paste buffer sec-advisor-<pid> predictable; lingers if paste fails. :330-334        
+                                                                         
+  Distinct from run-1 F7 (that was lexicographic correctness; N1's payload is                
+  attacker-supplied). Overlaps with F2/F3 not re-litigated.
+
+  Fix plan core                                                          
+                                               
+  Root cause of N1+N2: control state lives in the untrusted tree. Top fix — relocate         
+  runtime/control metadata to ~/.local/state/sec-advisor/<hash>/ (out of repo) + host-side
+  latest.json pointer with tmux has-session validation. Closes N1 and run-1 F7 together.     
+  Residual in-repo writes get O_NOFOLLOW|O_EXCL|0600. Then hash-based session names (N3),
+  token-gated __controller (N4), try/finally delete-buffer (N5).
+
+  Containment from run-1 (F1/F8) stays the dominant priority — N1/N2 are reachable because   
+  the same hostile-code premise applies to the orchestrator's own I/O.
+
+✻ Baked for 3m 32s                                                       
+                                               
+─────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+─────────────────────────────────────────────────────────────────────────────────────────────
+  [CAVEMAN:LITE] Opus 4.8 (1M context) ░░░░░░░░░░ 7% █░░░░░░░░░ 10% 04:00
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+
+
