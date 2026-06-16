@@ -5,17 +5,13 @@
   "run_seconds": 2700,
   "ready_check_seconds": 60,
   "ready_check_lines": 1,
-  "ready_markers": [
-    "Ready"
-  ],
+  "ready_markers": ["Ready"],
   "block_marker": "DO-NOT-PROCEED",
   "block_check_lines": 10,
   "prompts": [],
   "prompt_files": [
-    "prompts/001-template-tag-inventory-and-missing-tags.md",
-    "prompts/002-shared-template-tag-value-context.md",
-    "prompts/003-docx-known-ui-tags.md",
-    "prompts/004-pptx-known-ui-tags-and-main-image.md",
-    "prompts/005-template-maker-ux-and-final-verification.md"
+    "prompts/001-portal-publication-backend-stamping.md",
+    "prompts/002-portal-doc-upload-typing-ui.md",
+    "prompts/003-portal-selection-only-wizard-and-review.md"
   ]
 }
