@@ -22,6 +22,7 @@ Use deterministic names such as `001-phase-name.md`, `002-phase-name.md`.
 
 4. Write `prompt-queue/.env.local` so:
    - `PROMPT_QUEUE_WORKDIR` is the target repo absolute path.
+   - `CODEX_THREAD_ID` is the current Codex session id, when available.
 5. Replace `prompt-queue/config.json` so:
    - `project_dir` is `"${PROMPT_QUEUE_WORKDIR}"`.
    - `command` is `cdx`.
@@ -33,7 +34,7 @@ Use deterministic names such as `001-phase-name.md`, `002-phase-name.md`.
    - `block_marker` is `"DO-NOT-PROCEED"`.
    - `block_check_lines` is `10`.
    - `blocked_recovery` is `true` when the current Codex session id is available.
-   - `blocked_recovery_session_id` is the current Codex session id from `CODEX_THREAD_ID`.
+   - `blocked_recovery_session_id` is `"${CODEX_THREAD_ID}"`.
    - `blocked_recovery_command` is `cdx`.
    - `blocked_recovery_success_marker` is `"PROCEED-ALLOWED"`.
    - `blocked_recovery_human_marker` is `"HUMAN-DECISION-REQUIRED"`.
@@ -42,7 +43,7 @@ Use deterministic names such as `001-phase-name.md`, `002-phase-name.md`.
    - `blocked_recovery_run_seconds` is `2700`.
    - `blocked_recovery_check_lines` is `20`.
    - `completion_notify` is `true` when the current Codex session id is available.
-   - `completion_notify_session_id` is the current Codex session id from `CODEX_THREAD_ID`.
+   - `completion_notify_session_id` is `"${CODEX_THREAD_ID}"`.
    - `completion_notify_command` is `cdx`.
    - `completion_notify_run_seconds` is `2700`.
    - `completion_notify_check_lines` is `20`.
@@ -55,8 +56,8 @@ Use deterministic names such as `001-phase-name.md`, `002-phase-name.md`.
 7. Report the prompt count, target repo, env path, config path, and run command.
 
 If `CODEX_THREAD_ID` is unavailable, set `blocked_recovery` and
-`completion_notify` to `false` and omit the planner session ids instead of
-guessing.
+`completion_notify` to `false` and omit `CODEX_THREAD_ID` from `.env.local`
+instead of guessing.
 
 Do not start the tmux queue unless the user explicitly asks you to run it.
 
