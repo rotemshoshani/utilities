@@ -1,0 +1,19 @@
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+
+# Automation/session artifacts
+.planning/
+**/.planning/
+
+# Python generated files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Editor/OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

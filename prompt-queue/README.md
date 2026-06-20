@@ -7,6 +7,17 @@ prompt, the controller starts a fresh agent process, sends that prompt as the
 initial CLI prompt, waits up to 45 minutes, captures the worker pane, stops
 the agent by respawning the worker pane, and continues to the next prompt.
 
+When blocked recovery is enabled, it also opens a planner pane. If an executor
+finishes with `DO-NOT-PROCEED`, the controller resumes the configured planner
+Codex session in that pane, asks it to inspect the blocked run, and waits until
+the planner pane is `Ready`. Only then does it inspect recent planner output for
+an exact `PROCEED-ALLOWED` or `HUMAN-DECISION-REQUIRED` marker.
+
+When completion notification is enabled, the controller also resumes the planner
+session after every queued prompt has completed. It asks the planner to verify
+the finished work, fix issues if needed, and waits until that planner pane is
+`Ready` before marking the queue complete.
+
 All run artifacts are written under the target repo:
 
 ```bash
@@ -174,6 +185,34 @@ After `Ready` is detected, the controller also checks recent output for an
 exact line matching `DO-NOT-PROCEED`. If found, it writes the capture, records
 `blocked.json`, leaves the worker pane intact, and stops the queue before the
 next prompt.
+
+Blocked recovery settings:
+
+- `blocked_recovery`: enable planner-assisted recovery, default `false`
+- `blocked_recovery_session_id`: Codex session id to resume for recovery
+- `blocked_recovery_command`: command used for recovery, default `cdx`
+- `blocked_recovery_success_marker`: exact proceed line, default `PROCEED-ALLOWED`
+- `blocked_recovery_human_marker`: exact human-needed line, default `HUMAN-DECISION-REQUIRED`
+- `blocked_recovery_action`: `retry` or `continue`, default `retry`
+- `blocked_recovery_max_attempts`: recovery attempts per prompt, default `1`
+- `blocked_recovery_run_seconds`: recovery timeout, default `2700`
+- `blocked_recovery_check_lines`: recent planner rows to scan after `Ready`, default `20`
+
+With the default `retry` action, a successful recovery retries the blocked
+prompt once. The controller never proceeds from a recovery marker alone; the
+bottom of the planner pane must first match a configured ready marker, normally
+`Ready`.
+
+Completion notification settings:
+
+- `completion_notify`: resume the planner after all prompts finish, default `false`
+- `completion_notify_session_id`: Codex session id to resume; defaults to `blocked_recovery_session_id`
+- `completion_notify_command`: command used for completion verification; defaults to `blocked_recovery_command` or `cdx`
+- `completion_notify_run_seconds`: completion verification timeout, default `2700`
+- `completion_notify_check_lines`: reserved recent planner rows setting, default `20`
+
+Completion notification has no proceed marker. The controller waits for the
+planner pane bottom line to match a ready marker, normally `Ready`.
 
 Readiness samples are written to:
 

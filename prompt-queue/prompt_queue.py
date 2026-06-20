@@ -24,6 +24,8 @@ TIMESTAMP_FORMAT = "%Y%m%d-%H%M%S"
 NO_MORE_PROMPTS = "no more prompts"
 DEFAULT_PROMPT_END_MARKER = "::end"
 DEFAULT_BLOCK_MARKER = "DO-NOT-PROCEED"
+DEFAULT_RECOVERY_SUCCESS_MARKER = "PROCEED-ALLOWED"
+DEFAULT_RECOVERY_HUMAN_MARKER = "HUMAN-DECISION-REQUIRED"
 WORKDIR_ENV_KEY = "PROMPT_QUEUE_WORKDIR"
 DEFAULT_CODEX_COMMAND = "cdx"
 DEFAULT_CLAUDE_COMMAND = "cld"
@@ -55,6 +57,20 @@ class Config:
     ready_markers: tuple[str, ...]
     block_marker: str
     block_check_lines: int
+    blocked_recovery: bool
+    blocked_recovery_command: str
+    blocked_recovery_session_id: str
+    blocked_recovery_success_marker: str
+    blocked_recovery_human_marker: str
+    blocked_recovery_action: str
+    blocked_recovery_max_attempts: int
+    blocked_recovery_run_seconds: int
+    blocked_recovery_check_lines: int
+    completion_notify: bool
+    completion_notify_command: str
+    completion_notify_session_id: str
+    completion_notify_run_seconds: int
+    completion_notify_check_lines: int
     prompts: tuple[PromptItem, ...]
 
 
@@ -128,6 +144,20 @@ def load_config(
     else:
         raise ValueError("ready_markers must be a string or an array of strings")
 
+    blocked_recovery = bool(raw.get("blocked_recovery", False))
+    blocked_recovery_session_id = expand_config_string(str(raw.get("blocked_recovery_session_id", "")))
+    blocked_recovery_success_marker = str(
+        raw.get("blocked_recovery_success_marker", DEFAULT_RECOVERY_SUCCESS_MARKER)
+    )
+    blocked_recovery_human_marker = str(raw.get("blocked_recovery_human_marker", DEFAULT_RECOVERY_HUMAN_MARKER))
+    blocked_recovery_action = str(raw.get("blocked_recovery_action", "retry"))
+    if blocked_recovery_action not in {"retry", "continue"}:
+        raise ValueError("blocked_recovery_action must be 'retry' or 'continue'")
+    completion_notify = bool(raw.get("completion_notify", False))
+    completion_notify_session_id = expand_config_string(
+        str(raw.get("completion_notify_session_id", raw.get("blocked_recovery_session_id", "")))
+    )
+
     return Config(
         project_dir=project_dir,
         runtime_dir=runtime_dir,
@@ -143,8 +173,29 @@ def load_config(
         ready_markers=ready_marker_values,
         block_marker=str(raw.get("block_marker", DEFAULT_BLOCK_MARKER)),
         block_check_lines=int(raw.get("block_check_lines", 10)),
+        blocked_recovery=blocked_recovery,
+        blocked_recovery_command=str(raw.get("blocked_recovery_command", DEFAULT_CODEX_COMMAND)),
+        blocked_recovery_session_id=blocked_recovery_session_id,
+        blocked_recovery_success_marker=blocked_recovery_success_marker,
+        blocked_recovery_human_marker=blocked_recovery_human_marker,
+        blocked_recovery_action=blocked_recovery_action,
+        blocked_recovery_max_attempts=int(raw.get("blocked_recovery_max_attempts", 1)),
+        blocked_recovery_run_seconds=int(raw.get("blocked_recovery_run_seconds", 2700)),
+        blocked_recovery_check_lines=int(raw.get("blocked_recovery_check_lines", 20)),
+        completion_notify=completion_notify,
+        completion_notify_command=str(raw.get("completion_notify_command", raw.get("blocked_recovery_command", DEFAULT_CODEX_COMMAND))),
+        completion_notify_session_id=completion_notify_session_id,
+        completion_notify_run_seconds=int(raw.get("completion_notify_run_seconds", 2700)),
+        completion_notify_check_lines=int(raw.get("completion_notify_check_lines", 20)),
         prompts=prompts,
     )
+
+
+def expand_config_string(value: str) -> str:
+    expanded = os.path.expandvars(os.path.expanduser(value)).strip()
+    if "$" in expanded:
+        return ""
+    return expanded
 
 
 def load_config_prompts(raw: dict[str, object], base_dir: Path) -> list[PromptItem]:
@@ -276,6 +327,10 @@ def build_worker_cd_command(project_dir: Path) -> str:
 
 def build_prompt_argument_command(command: str, prompt_file: Path) -> str:
     return f"{command} \"$(cat {sh_quote(str(prompt_file))})\""
+
+
+def build_resume_prompt_command(command: str, session_id: str, prompt_file: Path) -> str:
+    return f"{command} resume {sh_quote(session_id)} \"$(cat {sh_quote(str(prompt_file))})\""
 
 
 def apply_agent_override(config: Config, use_claude: bool) -> Config:
@@ -441,10 +496,11 @@ def write_collected_prompts(
 
 
 class Controller:
-    def __init__(self, config: Config, session: str, worker_pane: str) -> None:
+    def __init__(self, config: Config, session: str, worker_pane: str, planner_pane: str = "") -> None:
         self.config = config
         self.session = session
         self.worker_pane = worker_pane
+        self.planner_pane = planner_pane
         self.queue = build_run_queue(config)
         self.completed: set[int] = set()
         self.current_index: int | None = None
@@ -456,9 +512,20 @@ class Controller:
         self.prompt_dir = config.runtime_dir / "prompts"
         self.capture_dir = config.runtime_dir / "captures"
         self.ready_check_dir = config.runtime_dir / "ready-checks"
+        self.recovery_prompt_dir = config.runtime_dir / "recovery-prompts"
+        self.recovery_check_dir = config.runtime_dir / "recovery-checks"
+        self.completion_prompt_dir = config.runtime_dir / "completion-prompts"
+        self.completion_check_dir = config.runtime_dir / "completion-checks"
         self.block_detected = False
         self.block_marker_line: str | None = None
         self.block_checked_at: str | None = None
+        self.last_recovery_check_line: str | None = None
+        self.last_recovery_check_at: str | None = None
+        self.recovery_detected = False
+        self.recovery_marker_line: str | None = None
+        self.last_completion_check_line: str | None = None
+        self.last_completion_check_at: str | None = None
+        self.completion_notify_done = False
 
     def run(self) -> None:
         if not self.queue:
@@ -468,24 +535,48 @@ class Controller:
         self.prompt_dir.mkdir(parents=True, exist_ok=True)
         self.capture_dir.mkdir(parents=True, exist_ok=True)
         self.ready_check_dir.mkdir(parents=True, exist_ok=True)
+        self.recovery_prompt_dir.mkdir(parents=True, exist_ok=True)
+        self.recovery_check_dir.mkdir(parents=True, exist_ok=True)
+        self.completion_prompt_dir.mkdir(parents=True, exist_ok=True)
+        self.completion_check_dir.mkdir(parents=True, exist_ok=True)
         write_json(self.config.runtime_dir / "controller.json", {"pid": os.getpid(), "session": self.session})
         self.render()
 
         for item in self.queue:
-            if should_stop_after_current(self.config.runtime_dir):
-                self.phase = "stopped before next prompt"
-                self.current_index = None
-                self.render()
-                return
-            if not self.run_one(item):
+            recovery_attempts = 0
+            while True:
+                if should_stop_after_current(self.config.runtime_dir):
+                    self.phase = "stopped before next prompt"
+                    self.current_index = None
+                    self.render()
+                    return
+                result = self.run_one(item, recovery_attempts)
+                if result == "complete":
+                    break
+                if result == "continue":
+                    self.completed.add(item.index)
+                    self.current_index = None
+                    self.phase = "continued after recovery"
+                    self.remaining_seconds = None
+                    self.stop_worker()
+                    self.render()
+                    break
+                if result == "retry":
+                    recovery_attempts += 1
+                    self.phase = "retrying after recovery"
+                    self.remaining_seconds = None
+                    self.render()
+                    continue
                 return
 
         self.current_index = None
+        if self.config.completion_notify:
+            self.notify_completion()
         self.phase = "complete"
         self.remaining_seconds = None
         self.render()
 
-    def run_one(self, item: RunItem) -> bool:
+    def run_one(self, item: RunItem, recovery_attempts: int = 0) -> str:
         self.current_index = item.index
         self.phase = "launching"
         self.remaining_seconds = None
@@ -513,16 +604,19 @@ class Controller:
         if sleep_result == "blocked":
             self.phase = "blocked"
             self.remaining_seconds = None
-            self.write_blocked_state(item, capture_path)
+            self.write_blocked_state(item, capture_path, recovery_attempts)
             self.render()
-            return False
+            recovery_result = self.try_blocked_recovery(item, capture_path, recovery_attempts)
+            if recovery_result in {"retry", "continue"}:
+                return recovery_result
+            return "blocked"
         self.stop_worker()
         self.completed.add(item.index)
         self.current_index = None
         self.phase = "captured"
         self.remaining_seconds = None
         self.render()
-        return True
+        return "complete"
 
     def recycle_worker(self) -> None:
         if tmux_target_exists(self.worker_pane):
@@ -547,6 +641,11 @@ class Controller:
 
     def send_key(self, key: str) -> None:
         tmux("send-keys", "-t", self.worker_pane, key)
+
+    def send_planner_shell_command(self, command: str) -> None:
+        if not self.planner_pane:
+            raise RuntimeError("planner pane is not configured")
+        tmux("send-keys", "-t", self.planner_pane, command, "Enter")
 
     def write_prompt_file(self, item: RunItem) -> Path:
         safe_name = sanitize_name(item.prompt_name)
@@ -593,6 +692,14 @@ class Controller:
         return path
 
     def capture_worker_tail(self, lines: int) -> str:
+        return self.capture_pane_tail(self.worker_pane, lines)
+
+    def capture_planner_tail(self, lines: int) -> str:
+        if not self.planner_pane:
+            return ""
+        return self.capture_pane_tail(self.planner_pane, lines)
+
+    def capture_pane_tail(self, pane: str, lines: int) -> str:
         return tmux(
             "capture-pane",
             "-p",
@@ -600,7 +707,7 @@ class Controller:
             "-S",
             f"-{max(1, lines)}",
             "-t",
-            self.worker_pane,
+            pane,
             capture=True,
         ).stdout
 
@@ -648,7 +755,7 @@ class Controller:
             return "ready"
         return "waiting"
 
-    def write_blocked_state(self, item: RunItem, capture_path: Path) -> None:
+    def write_blocked_state(self, item: RunItem, capture_path: Path, recovery_attempts: int) -> None:
         write_json(
             self.config.runtime_dir / "blocked.json",
             {
@@ -658,7 +765,297 @@ class Controller:
                 "marker": self.config.block_marker,
                 "matched_line": self.block_marker_line,
                 "checked_at": self.block_checked_at,
-                "action": "queue stopped; worker pane preserved for inspection",
+                "recovery_attempts": recovery_attempts,
+                "action": (
+                    "auto-recovery pending; worker pane preserved for inspection"
+                    if self.config.blocked_recovery
+                    else "queue stopped; worker pane preserved for inspection"
+                ),
+            },
+        )
+
+    def try_blocked_recovery(self, item: RunItem, capture_path: Path, recovery_attempts: int) -> str:
+        if not self.config.blocked_recovery:
+            return "blocked"
+        if not self.planner_pane:
+            self.write_recovery_state(item, "blocked", "missing planner pane", recovery_attempts)
+            return "blocked"
+        if not self.config.blocked_recovery_session_id:
+            self.write_recovery_state(item, "blocked", "missing blocked_recovery_session_id", recovery_attempts)
+            return "blocked"
+        if recovery_attempts >= max(0, self.config.blocked_recovery_max_attempts):
+            self.write_recovery_state(item, "blocked", "recovery attempts exhausted", recovery_attempts)
+            return "blocked"
+
+        prompt_file = self.write_recovery_prompt_file(item, capture_path, recovery_attempts)
+        self.phase = "blocked recovery launching"
+        self.remaining_seconds = None
+        self.render()
+        tmux("respawn-pane", "-k", "-t", self.planner_pane, "-c", str(self.config.project_dir), "bash")
+        self.sleep_with_controls(1, "planner fresh shell")
+        self.send_planner_shell_command(
+            build_resume_prompt_command(
+                self.config.blocked_recovery_command,
+                self.config.blocked_recovery_session_id,
+                prompt_file,
+            )
+        )
+
+        recovery_result = self.wait_for_blocked_recovery(item, recovery_attempts)
+        if recovery_result == "proceed":
+            action = self.config.blocked_recovery_action
+            self.write_recovery_state(item, action, self.config.blocked_recovery_success_marker, recovery_attempts)
+            return action
+        if recovery_result == "human":
+            self.write_recovery_state(item, "blocked", self.config.blocked_recovery_human_marker, recovery_attempts)
+            return "blocked"
+        self.write_recovery_state(item, "blocked", recovery_result, recovery_attempts)
+        return "blocked"
+
+    def write_recovery_prompt_file(self, item: RunItem, capture_path: Path, recovery_attempts: int) -> Path:
+        safe_name = sanitize_name(item.prompt_name)
+        prompt_file = self.recovery_prompt_dir / f"{item.index:03d}-{safe_name}-attempt-{recovery_attempts + 1}.txt"
+        blocked_path = self.config.runtime_dir / "blocked.json"
+        prompt_file.write_text(
+            "\n".join(
+                [
+                    "The prompt-queue executor stopped because it output DO-NOT-PROCEED.",
+                    "",
+                    f"Target repo: {self.config.project_dir}",
+                    f"Runtime dir: {self.config.runtime_dir}",
+                    f"Blocked metadata: {blocked_path}",
+                    f"Failed executor capture: {capture_path}",
+                    f"Prompt index: {item.index}",
+                    f"Prompt name: {item.prompt_name}",
+                    f"Recovery attempt: {recovery_attempts + 1} of {self.config.blocked_recovery_max_attempts}",
+                    "",
+                    "Inspect the blocked metadata, failed capture, and current worktree.",
+                    "If the issue is mechanical, local, and safely fixable, fix it and run focused verification.",
+                    "Do not make product decisions, destructive git changes, credential changes, or irreversible data changes.",
+                    "If human judgment is needed, do not guess.",
+                    "",
+                    f"If you fixed the issue and the queue may continue, write exactly {self.config.blocked_recovery_success_marker} on its own final content line.",
+                    f"If human judgment is needed, write exactly {self.config.blocked_recovery_human_marker} on its own final content line.",
+                    "The controller will only read the marker after your Codex pane is Ready.",
+                ]
+            )
+        )
+        write_json(
+            self.config.runtime_dir / "last-recovery-prompt.json",
+            {
+                "run_index": item.index,
+                "name": item.prompt_name,
+                "path": str(prompt_file),
+                "attempt": recovery_attempts + 1,
+            },
+        )
+        return prompt_file
+
+    def wait_for_blocked_recovery(self, item: RunItem, recovery_attempts: int) -> str:
+        deadline = time.time() + max(0, self.config.blocked_recovery_run_seconds)
+        ready_interval = max(1, self.config.ready_check_seconds)
+        next_ready_check = time.time() + ready_interval
+        while True:
+            remaining = int(round(deadline - time.time()))
+            if remaining <= 0:
+                self.remaining_seconds = None
+                self.phase = "blocked recovery timed out"
+                self.render()
+                return "timeout"
+            self.phase = "blocked recovery"
+            self.remaining_seconds = remaining
+            self.render()
+            self.handle_keyboard()
+            if consume_finish_current_sleep(self.config.runtime_dir):
+                next_ready_check = time.time()
+            if time.time() >= next_ready_check:
+                result = self.check_recovery_marker(item, recovery_attempts)
+                if result in {"proceed", "human", "ready-without-marker"}:
+                    self.remaining_seconds = None
+                    self.phase = f"blocked recovery {result}"
+                    self.render()
+                    return result
+                next_ready_check = time.time() + ready_interval
+            time.sleep(min(1, remaining))
+
+    def check_recovery_marker(self, item: RunItem, recovery_attempts: int) -> str:
+        captured = self.capture_planner_tail(self.config.ready_check_lines)
+        non_empty_lines = [line for line in captured.splitlines() if line.strip()]
+        last_line = non_empty_lines[-1] if non_empty_lines else ""
+        matched_ready = next((marker for marker in self.config.ready_markers if marker in last_line), "")
+        checked_at = datetime.now().isoformat(timespec="seconds")
+        self.last_recovery_check_line = last_line
+        self.last_recovery_check_at = checked_at
+
+        recovery_line = ""
+        result = "waiting"
+        if matched_ready:
+            marker_captured = self.capture_planner_tail(self.config.blocked_recovery_check_lines)
+            marker_lines = [line.strip() for line in marker_captured.splitlines() if line.strip()]
+            recent_lines = marker_lines[-self.config.blocked_recovery_check_lines :]
+            if self.config.blocked_recovery_human_marker in recent_lines:
+                recovery_line = self.config.blocked_recovery_human_marker
+                result = "human"
+            elif self.config.blocked_recovery_success_marker in recent_lines:
+                recovery_line = self.config.blocked_recovery_success_marker
+                result = "proceed"
+            else:
+                result = "ready-without-marker"
+            self.recovery_detected = bool(recovery_line)
+            self.recovery_marker_line = recovery_line or None
+
+        safe_name = sanitize_name(item.prompt_name)
+        log_path = self.recovery_check_dir / f"{item.index:03d}-{safe_name}.jsonl"
+        with log_path.open("a") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "checked_at": checked_at,
+                        "run_index": item.index,
+                        "name": item.prompt_name,
+                        "attempt": recovery_attempts + 1,
+                        "last_line": last_line,
+                        "ready_matched": bool(matched_ready),
+                        "matched_ready_marker": matched_ready,
+                        "result": result,
+                        "recovery_marker": recovery_line,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+        return result
+
+    def write_recovery_state(self, item: RunItem, action: str, reason: str, recovery_attempts: int) -> None:
+        write_json(
+            self.config.runtime_dir / "recovery.json",
+            {
+                "run_index": item.index,
+                "name": item.prompt_name,
+                "action": action,
+                "reason": reason,
+                "attempt": recovery_attempts + 1,
+                "checked_at": self.last_recovery_check_at,
+                "last_line": self.last_recovery_check_line,
+                "marker_line": self.recovery_marker_line,
+            },
+        )
+
+    def notify_completion(self) -> None:
+        if not self.planner_pane:
+            self.write_completion_state("skipped", "missing planner pane")
+            return
+        if not self.config.completion_notify_session_id:
+            self.write_completion_state("skipped", "missing completion_notify_session_id")
+            return
+
+        prompt_file = self.write_completion_prompt_file()
+        self.phase = "completion notify launching"
+        self.remaining_seconds = None
+        self.render()
+        tmux("respawn-pane", "-k", "-t", self.planner_pane, "-c", str(self.config.project_dir), "bash")
+        self.sleep_with_controls(1, "planner fresh shell")
+        self.send_planner_shell_command(
+            build_resume_prompt_command(
+                self.config.completion_notify_command,
+                self.config.completion_notify_session_id,
+                prompt_file,
+            )
+        )
+        result = self.wait_for_completion_notify()
+        self.completion_notify_done = result == "ready"
+        self.write_completion_state(result, "planner reached Ready" if result == "ready" else result)
+
+    def write_completion_prompt_file(self) -> Path:
+        prompt_file = self.completion_prompt_dir / "verify-completed-run.txt"
+        prompt_file.write_text(
+            "\n".join(
+                [
+                    "The prompt-queue executor finished all queued prompts.",
+                    "",
+                    f"Target repo: {self.config.project_dir}",
+                    f"Runtime dir: {self.config.runtime_dir}",
+                    f"Queue metadata: {self.config.runtime_dir / 'queue.json'}",
+                    f"State file: {self.config.runtime_dir / 'state.json'}",
+                    f"Executor captures: {self.capture_dir}",
+                    f"Executor prompts: {self.prompt_dir}",
+                    "",
+                    "Verify the original plan is complete against the current worktree.",
+                    "Inspect the executor captures and run focused verification commands.",
+                    "If you find implementation errors or missing work, make the needed changes and verify them.",
+                    "Do not commit unless explicitly requested.",
+                    "",
+                    "When finished, provide a concise verification summary and let Codex return to Ready.",
+                ]
+            )
+        )
+        write_json(
+            self.config.runtime_dir / "last-completion-prompt.json",
+            {"path": str(prompt_file), "prompt_count": len(self.queue)},
+        )
+        return prompt_file
+
+    def wait_for_completion_notify(self) -> str:
+        deadline = time.time() + max(0, self.config.completion_notify_run_seconds)
+        ready_interval = max(1, self.config.ready_check_seconds)
+        next_ready_check = time.time() + ready_interval
+        while True:
+            remaining = int(round(deadline - time.time()))
+            if remaining <= 0:
+                self.remaining_seconds = None
+                self.phase = "completion notify timed out"
+                self.render()
+                return "timeout"
+            self.phase = "completion notify"
+            self.remaining_seconds = remaining
+            self.render()
+            self.handle_keyboard()
+            if consume_finish_current_sleep(self.config.runtime_dir):
+                next_ready_check = time.time()
+            if time.time() >= next_ready_check:
+                result = self.check_completion_ready()
+                if result == "ready":
+                    self.remaining_seconds = None
+                    self.phase = "completion notify ready"
+                    self.render()
+                    return "ready"
+                next_ready_check = time.time() + ready_interval
+            time.sleep(min(1, remaining))
+
+    def check_completion_ready(self) -> str:
+        captured = self.capture_planner_tail(self.config.ready_check_lines)
+        non_empty_lines = [line for line in captured.splitlines() if line.strip()]
+        last_line = non_empty_lines[-1] if non_empty_lines else ""
+        matched_ready = next((marker for marker in self.config.ready_markers if marker in last_line), "")
+        checked_at = datetime.now().isoformat(timespec="seconds")
+        self.last_completion_check_line = last_line
+        self.last_completion_check_at = checked_at
+
+        log_path = self.completion_check_dir / "verify-completed-run.jsonl"
+        with log_path.open("a") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "checked_at": checked_at,
+                        "last_line": last_line,
+                        "ready_matched": bool(matched_ready),
+                        "matched_ready_marker": matched_ready,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+        return "ready" if matched_ready else "waiting"
+
+    def write_completion_state(self, status: str, reason: str) -> None:
+        write_json(
+            self.config.runtime_dir / "completion.json",
+            {
+                "status": status,
+                "reason": reason,
+                "checked_at": self.last_completion_check_at,
+                "last_line": self.last_completion_check_line,
+                "prompt_count": len(self.queue),
             },
         )
 
@@ -716,6 +1113,7 @@ class Controller:
             {
                 "session": self.session,
                 "worker_pane": self.worker_pane,
+                "planner_pane": self.planner_pane,
                 "phase": self.phase,
                 "current_index": self.current_index,
                 "completed": sorted(self.completed),
@@ -728,6 +1126,13 @@ class Controller:
                 "block_detected": self.block_detected,
                 "block_marker_line": self.block_marker_line,
                 "block_checked_at": self.block_checked_at,
+                "last_recovery_check_at": self.last_recovery_check_at,
+                "last_recovery_check_line": self.last_recovery_check_line,
+                "recovery_detected": self.recovery_detected,
+                "recovery_marker_line": self.recovery_marker_line,
+                "last_completion_check_at": self.last_completion_check_at,
+                "last_completion_check_line": self.last_completion_check_line,
+                "completion_notify_done": self.completion_notify_done,
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             },
         )
@@ -757,10 +1162,10 @@ def run_controller(args: argparse.Namespace) -> None:
     old_attrs = termios.tcgetattr(sys.stdin)
     try:
         tty.setcbreak(sys.stdin.fileno())
-        Controller(config, args.session, args.worker_pane).run()
+        Controller(config, args.session, args.worker_pane, args.planner_pane).run()
         while True:
             select.select([sys.stdin], [], [], 1)
-            Controller(config, args.session, args.worker_pane).handle_keyboard()
+            Controller(config, args.session, args.worker_pane, args.planner_pane).handle_keyboard()
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_attrs)
 
@@ -773,6 +1178,10 @@ def start_session(args: argparse.Namespace) -> None:
     initial_config = apply_agent_override(load_config(config_path), args.cld)
     if not initial_config.prompts:
         raise SystemExit("prompt-queue: configure prompts or prompt_files in config.json")
+    if initial_config.blocked_recovery and not initial_config.blocked_recovery_session_id:
+        raise SystemExit("prompt-queue: blocked_recovery requires blocked_recovery_session_id")
+    if initial_config.completion_notify and not initial_config.completion_notify_session_id:
+        raise SystemExit("prompt-queue: completion_notify requires completion_notify_session_id")
 
     start_stamp = datetime.now().strftime(TIMESTAMP_FORMAT)
     config = replace(
@@ -814,6 +1223,21 @@ def start_session(args: argparse.Namespace) -> None:
         "bash",
         capture=True,
     ).stdout.strip()
+    planner_id = ""
+    if config.blocked_recovery or config.completion_notify:
+        planner_id = tmux(
+            "split-window",
+            "-t",
+            controller_id,
+            "-h",
+            "-c",
+            str(config.project_dir),
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "bash",
+            capture=True,
+        ).stdout.strip()
     worker_id = tmux(
         "split-window",
         "-t",
@@ -841,6 +1265,7 @@ def start_session(args: argparse.Namespace) -> None:
         f"__controller "
         f"--session {sh_quote(session)} "
         f"--worker-pane {sh_quote(worker_id)} "
+        f"--planner-pane {sh_quote(planner_id)} "
         f"--runtime-dir {sh_quote(str(config.runtime_dir))} "
         f"--queue-file {sh_quote(str(queue_file))}"
     )
@@ -852,6 +1277,7 @@ def start_session(args: argparse.Namespace) -> None:
         {
             "session": session,
             "worker_pane": worker_id,
+            "planner_pane": planner_id,
             "project_dir": str(config.project_dir),
             "runtime_dir": str(config.runtime_dir),
             "queue_file": str(queue_file),
@@ -859,6 +1285,10 @@ def start_session(args: argparse.Namespace) -> None:
             "prompt_count": len(config.prompts),
             "command": config.command,
             "prompt_delivery": config.prompt_delivery,
+            "blocked_recovery": config.blocked_recovery,
+            "blocked_recovery_session_id": config.blocked_recovery_session_id,
+            "completion_notify": config.completion_notify,
+            "completion_notify_session_id": config.completion_notify_session_id,
         },
     )
     if not args.no_attach:
@@ -977,6 +1407,7 @@ def build_parser() -> argparse.ArgumentParser:
     controller = sub.add_parser("__controller")
     controller.add_argument("--session", required=True)
     controller.add_argument("--worker-pane", required=True)
+    controller.add_argument("--planner-pane", default="")
     controller.add_argument("--runtime-dir", default="")
     controller.add_argument("--queue-file", default="")
     controller.set_defaults(func=run_controller)

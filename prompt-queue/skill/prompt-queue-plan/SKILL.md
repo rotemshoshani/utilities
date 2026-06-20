@@ -32,10 +32,31 @@ Use deterministic names such as `001-phase-name.md`, `002-phase-name.md`.
    - `ready_markers` is `["Ready"]`.
    - `block_marker` is `"DO-NOT-PROCEED"`.
    - `block_check_lines` is `10`.
-   - `prompts` references the files you wrote, in order.
-   - `prompt_files` is `[]`.
+   - `blocked_recovery` is `true` when the current Codex session id is available.
+   - `blocked_recovery_session_id` is the current Codex session id from `CODEX_THREAD_ID`.
+   - `blocked_recovery_command` is `cdx`.
+   - `blocked_recovery_success_marker` is `"PROCEED-ALLOWED"`.
+   - `blocked_recovery_human_marker` is `"HUMAN-DECISION-REQUIRED"`.
+   - `blocked_recovery_action` is `"retry"`.
+   - `blocked_recovery_max_attempts` is `1`.
+   - `blocked_recovery_run_seconds` is `2700`.
+   - `blocked_recovery_check_lines` is `20`.
+   - `completion_notify` is `true` when the current Codex session id is available.
+   - `completion_notify_session_id` is the current Codex session id from `CODEX_THREAD_ID`.
+   - `completion_notify_command` is `cdx`.
+   - `completion_notify_run_seconds` is `2700`.
+   - `completion_notify_check_lines` is `20`.
+   - `prompts` is `[]`.
+   - `prompt_files` references the files you wrote, in order, as paths relative
+     to `prompt-queue/config.json` such as `"prompts/001-phase-name.md"`.
+     Do not put prompt file paths in `prompts`; this local runner treats string
+     entries in `prompts` as literal inline prompt text.
 6. Validate the JSON with `python3 -m json.tool`.
 7. Report the prompt count, target repo, env path, config path, and run command.
+
+If `CODEX_THREAD_ID` is unavailable, set `blocked_recovery` and
+`completion_notify` to `false` and omit the planner session ids instead of
+guessing.
 
 Do not start the tmux queue unless the user explicitly asks you to run it.
 

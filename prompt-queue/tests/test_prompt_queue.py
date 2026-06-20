@@ -11,6 +11,7 @@ from prompt_queue import (
     RunItem,
     apply_agent_override,
     build_prompt_argument_command,
+    build_resume_prompt_command,
     build_run_queue,
     build_worker_cd_command,
     consume_finish_current_sleep,
@@ -264,6 +265,64 @@ class PromptQueueTests(unittest.TestCase):
 
             self.assertIs(apply_agent_override(config, use_claude=False), config)
 
+    def test_unresolved_recovery_session_env_is_treated_as_missing(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            config_path = Path(raw_dir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "blocked_recovery": True,
+                        "blocked_recovery_session_id": "${PROMPT_QUEUE_MISSING_SESSION}",
+                        "prompts": ["one"],
+                    }
+                )
+            )
+
+            config = load_config(config_path)
+
+            self.assertEqual(config.blocked_recovery_session_id, "")
+
+    def test_completion_notify_reuses_recovery_session_by_default(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            config_path = Path(raw_dir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "completion_notify": True,
+                        "blocked_recovery_session_id": "planner-session",
+                        "prompts": ["one"],
+                    }
+                )
+            )
+
+            config = load_config(config_path)
+
+            self.assertTrue(config.completion_notify)
+            self.assertEqual(config.completion_notify_session_id, "planner-session")
+
+    def test_unresolved_completion_session_env_is_treated_as_missing(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            config_path = Path(raw_dir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "completion_notify": True,
+                        "completion_notify_session_id": "${PROMPT_QUEUE_MISSING_SESSION}",
+                        "prompts": ["one"],
+                    }
+                )
+            )
+
+            config = load_config(config_path)
+
+            self.assertEqual(config.completion_notify_session_id, "")
+
     def test_render_status_marks_done_in_progress_pending_and_stop_next(self) -> None:
         queue = [
             RunItem(index=1, prompt_name="first", prompt_text="one", prompt_source="test", command="cdx"),
@@ -318,6 +377,14 @@ class PromptQueueTests(unittest.TestCase):
         command = build_prompt_argument_command("cdx", Path("/tmp/project prompt.txt"))
 
         self.assertEqual(command, 'cdx "$(cat \'/tmp/project prompt.txt\')"')
+
+    def test_build_resume_prompt_command_quotes_session_and_prompt_file(self) -> None:
+        command = build_resume_prompt_command("cdx", "session with 'quote'", Path("/tmp/recovery prompt.txt"))
+
+        self.assertEqual(
+            command,
+            'cdx resume \'session with \'"\'"\'quote\'"\'"\'\' "$(cat \'/tmp/recovery prompt.txt\')"',
+        )
 
     def test_paste_settle_seconds_scales_by_prompt_size(self) -> None:
         self.assertEqual(paste_settle_seconds(499), 1.5)
@@ -459,6 +526,176 @@ class PromptQueueTests(unittest.TestCase):
 
             self.assertEqual(result, "ready")
             self.assertFalse(controller.block_detected)
+
+    def test_recovery_marker_waits_for_ready_before_proceeding(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        class FakeController(Controller):
+            def capture_pane_tail(self, pane: str, lines: int) -> str:
+                return "PROCEED-ALLOWED\n"
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            config_path = tmp_path / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "project_dir": "/tmp/project",
+                        "ready_check_lines": 1,
+                        "blocked_recovery": True,
+                        "blocked_recovery_session_id": "session-id",
+                        "prompts": ["prompt"],
+                    }
+                )
+            )
+            config = load_config(config_path, runtime_dir_override=tmp_path / "runtime")
+            controller = FakeController(config, "session", "%1", "%2")
+            controller.recovery_check_dir.mkdir(parents=True)
+
+            result = controller.check_recovery_marker(
+                RunItem(index=1, prompt_name="prompt-1", prompt_text="prompt", prompt_source="test", command="cdx"),
+                recovery_attempts=0,
+            )
+
+            self.assertEqual(result, "waiting")
+
+    def test_recovery_marker_proceeds_only_after_ready_bottom_line(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        class FakeController(Controller):
+            def __init__(self, *args: object) -> None:
+                super().__init__(*args)
+                self.calls = 0
+
+            def capture_pane_tail(self, pane: str, lines: int) -> str:
+                self.calls += 1
+                if self.calls == 1:
+                    return "Ready\n"
+                return "Fixed the issue.\nPROCEED-ALLOWED\nReady\n"
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            config_path = tmp_path / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "project_dir": "/tmp/project",
+                        "ready_check_lines": 1,
+                        "blocked_recovery": True,
+                        "blocked_recovery_session_id": "session-id",
+                        "prompts": ["prompt"],
+                    }
+                )
+            )
+            config = load_config(config_path, runtime_dir_override=tmp_path / "runtime")
+            controller = FakeController(config, "session", "%1", "%2")
+            controller.recovery_check_dir.mkdir(parents=True)
+
+            result = controller.check_recovery_marker(
+                RunItem(index=1, prompt_name="prompt-1", prompt_text="prompt", prompt_source="test", command="cdx"),
+                recovery_attempts=0,
+            )
+
+            self.assertEqual(result, "proceed")
+            self.assertEqual(controller.recovery_marker_line, "PROCEED-ALLOWED")
+
+    def test_recovery_human_marker_wins_over_proceed_marker(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        class FakeController(Controller):
+            def __init__(self, *args: object) -> None:
+                super().__init__(*args)
+                self.calls = 0
+
+            def capture_pane_tail(self, pane: str, lines: int) -> str:
+                self.calls += 1
+                if self.calls == 1:
+                    return "Ready\n"
+                return "PROCEED-ALLOWED\nHUMAN-DECISION-REQUIRED\nReady\n"
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            config_path = tmp_path / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "project_dir": "/tmp/project",
+                        "ready_check_lines": 1,
+                        "blocked_recovery": True,
+                        "blocked_recovery_session_id": "session-id",
+                        "prompts": ["prompt"],
+                    }
+                )
+            )
+            config = load_config(config_path, runtime_dir_override=tmp_path / "runtime")
+            controller = FakeController(config, "session", "%1", "%2")
+            controller.recovery_check_dir.mkdir(parents=True)
+
+            result = controller.check_recovery_marker(
+                RunItem(index=1, prompt_name="prompt-1", prompt_text="prompt", prompt_source="test", command="cdx"),
+                recovery_attempts=0,
+            )
+
+            self.assertEqual(result, "human")
+            self.assertEqual(controller.recovery_marker_line, "HUMAN-DECISION-REQUIRED")
+
+    def test_completion_notify_waits_for_ready_bottom_line(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        class FakeController(Controller):
+            def capture_pane_tail(self, pane: str, lines: int) -> str:
+                return "Verification finished\n"
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            config_path = tmp_path / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "project_dir": "/tmp/project",
+                        "ready_check_lines": 1,
+                        "completion_notify": True,
+                        "completion_notify_session_id": "session-id",
+                        "prompts": ["prompt"],
+                    }
+                )
+            )
+            config = load_config(config_path, runtime_dir_override=tmp_path / "runtime")
+            controller = FakeController(config, "session", "%1", "%2")
+            controller.completion_check_dir.mkdir(parents=True)
+
+            result = controller.check_completion_ready()
+
+            self.assertEqual(result, "waiting")
+
+    def test_completion_notify_ready_matches_bottom_line(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        class FakeController(Controller):
+            def capture_pane_tail(self, pane: str, lines: int) -> str:
+                return "Ready\n"
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            config_path = tmp_path / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "project_dir": "/tmp/project",
+                        "ready_check_lines": 1,
+                        "completion_notify": True,
+                        "completion_notify_session_id": "session-id",
+                        "prompts": ["prompt"],
+                    }
+                )
+            )
+            config = load_config(config_path, runtime_dir_override=tmp_path / "runtime")
+            controller = FakeController(config, "session", "%1", "%2")
+            controller.completion_check_dir.mkdir(parents=True)
+
+            result = controller.check_completion_ready()
+
+            self.assertEqual(result, "ready")
 
     def test_default_work_base_dir_lives_under_project_planning_work(self) -> None:
         self.assertEqual(

@@ -5,13 +5,35 @@
   "run_seconds": 2700,
   "ready_check_seconds": 60,
   "ready_check_lines": 1,
-  "ready_markers": ["Ready"],
+  "ready_markers": [
+    "Ready"
+  ],
   "block_marker": "DO-NOT-PROCEED",
   "block_check_lines": 10,
+  "blocked_recovery": true,
+  "blocked_recovery_session_id": "${CODEX_THREAD_ID}",
+  "blocked_recovery_command": "cdx",
+  "blocked_recovery_success_marker": "PROCEED-ALLOWED",
+  "blocked_recovery_human_marker": "HUMAN-DECISION-REQUIRED",
+  "blocked_recovery_action": "retry",
+  "blocked_recovery_max_attempts": 1,
+  "blocked_recovery_run_seconds": 2700,
+  "blocked_recovery_check_lines": 20,
+  "completion_notify": true,
+  "completion_notify_session_id": "${CODEX_THREAD_ID}",
+  "completion_notify_command": "cdx",
+  "completion_notify_run_seconds": 2700,
+  "completion_notify_check_lines": 20,
   "prompts": [],
   "prompt_files": [
-    "prompts/001-portal-publication-backend-stamping.md",
-    "prompts/002-portal-doc-upload-typing-ui.md",
-    "prompts/003-portal-selection-only-wizard-and-review.md"
+    "prompts/001-advisor-baseline-measurement.md",
+    "prompts/002-advisor-project-list-complete-results.md",
+    "prompts/003-advisor-log-pagination-correctness.md",
+    "prompts/004-advisor-notification-labels-settings.md",
+    "prompts/005-advisor-communications-pagination.md",
+    "prompts/006-advisor-project-shell-portal-calc.md",
+    "prompts/007-advisor-operations-query-slimdown.md",
+    "prompts/008-advisor-ui-reliability-and-bundles.md",
+    "prompts/009-advisor-final-verification-and-decisions.md"
   ]
 }
