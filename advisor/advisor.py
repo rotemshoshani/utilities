@@ -91,6 +91,10 @@ class Config:
     startup_wait_seconds: int
     post_startup_wait_seconds: int
     capture_lines: int
+    ready_check_seconds: int
+    ready_check_lines: int
+    ready_markers: tuple[str, ...]
+    ready_command_names: tuple[str, ...]
     history_limit: int
     session_name: str
     prompt: str
@@ -260,6 +264,10 @@ def config_from_resolved(
         startup_wait_seconds=int(raw.get("startup_wait_seconds", 10)),
         post_startup_wait_seconds=int(raw.get("post_startup_wait_seconds", 3)),
         capture_lines=int(raw.get("capture_lines", 500)),
+        ready_check_seconds=int(raw.get("ready_check_seconds", 60)),
+        ready_check_lines=int(raw.get("ready_check_lines", 1)),
+        ready_markers=tuple(str(marker) for marker in raw.get("ready_markers", ["Ready"])),
+        ready_command_names=tuple(str(name) for name in raw.get("ready_command_names", ["codex"])),
         history_limit=int(raw.get("history_limit", 200000)),
         session_name=str(raw.get("session_name", "advisor")),
         prompt=str(raw.get("prompt", "")),
@@ -302,11 +310,15 @@ def resolve_config(
         if topic_raw.get("agents"):
             agents = tuple(parse_agent(item) for item in topic_raw["agents"])
         else:
-            selected_command_names = [str(name) for name in command_names] if command_names else list(available_commands)
             default_models = {
                 str(command_name): [str(model) for model in models]
                 for command_name, models in topic_raw.get("default_models", {}).items()
             }
+            if default_models:
+                command_order = [str(name) for name in command_names] if command_names else list(available_commands)
+                selected_command_names = [name for name in command_order if name in default_models]
+            else:
+                selected_command_names = [str(name) for name in command_names] if command_names else list(available_commands)
             selected: list[Agent] = []
             for command_name in selected_command_names:
                 if command_name not in available_commands:
@@ -346,6 +358,10 @@ def resolve_config(
         startup_wait_seconds=int(raw.get("startup_wait_seconds", 10)),
         post_startup_wait_seconds=int(raw.get("post_startup_wait_seconds", 3)),
         capture_lines=int(raw.get("capture_lines", 500)),
+        ready_check_seconds=int(raw.get("ready_check_seconds", 60)),
+        ready_check_lines=int(raw.get("ready_check_lines", 1)),
+        ready_markers=tuple(str(marker) for marker in raw.get("ready_markers", ["Ready"])),
+        ready_command_names=tuple(str(name) for name in raw.get("ready_command_names", ["codex"])),
         history_limit=int(raw.get("history_limit", 200000)),
         session_name=str(topic_raw.get("session_name", raw.get("session_name", "advisor"))),
         prompt=prompt,
@@ -369,6 +385,10 @@ def config_to_resolved_json(config: Config) -> dict[str, Any]:
         "startup_wait_seconds": config.startup_wait_seconds,
         "post_startup_wait_seconds": config.post_startup_wait_seconds,
         "capture_lines": config.capture_lines,
+        "ready_check_seconds": config.ready_check_seconds,
+        "ready_check_lines": config.ready_check_lines,
+        "ready_markers": list(config.ready_markers),
+        "ready_command_names": list(config.ready_command_names),
         "history_limit": config.history_limit,
         "session_name": config.session_name,
         "prompt": config.prompt,
@@ -547,6 +567,19 @@ def build_prompt_argument_command(command: str, prompt_file: Path) -> str:
     return f"{command} \"$(cat {sh_quote(str(prompt_file))})\""
 
 
+def last_non_empty_line(text: str) -> str:
+    lines = [line for line in text.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def ready_marker_match(line: str, markers: tuple[str, ...]) -> str:
+    return next((marker for marker in markers if marker and marker in line), "")
+
+
+def should_check_ready_for_item(item: RunItem, command_names: tuple[str, ...]) -> bool:
+    return bool(item.command_name and item.command_name in command_names)
+
+
 class Controller:
     def __init__(self, config: Config, session: str, worker_pane: str) -> None:
         self.config = config
@@ -557,6 +590,9 @@ class Controller:
         self.current_index: int | None = None
         self.phase = "starting"
         self.remaining_seconds: int | None = None
+        self.last_ready_check_line: str | None = None
+        self.last_ready_check_at: str | None = None
+        self.ready_detected = False
         self.capture_dir = config.runtime_dir / "captures"
 
     def run(self) -> None:
@@ -611,7 +647,8 @@ class Controller:
             raise ValueError(f"unsupported prompt_delivery for {item.agent_name}: {item.prompt_delivery}")
 
         run_seconds = self.config.reviewer_run_seconds if item.prompt_kind == "reviewer" else self.config.run_seconds
-        self.sleep_with_controls(run_seconds, "agent working")
+        ready_item = item if should_check_ready_for_item(item, self.config.ready_command_names) else None
+        self.sleep_with_controls(run_seconds, "agent working", ready_item=ready_item)
         self.capture_run(item)
         self.completed.add(item.index)
         self.current_index = None
@@ -667,7 +704,42 @@ class Controller:
             {"run_index": item.index, "agent": item.agent_name, "path": str(path)},
         )
 
-    def sleep_with_controls(self, seconds: int, phase: str) -> None:
+    def capture_worker_tail(self, lines: int) -> str:
+        return tmux(
+            "capture-pane",
+            "-p",
+            "-J",
+            "-S",
+            f"-{max(1, lines)}",
+            "-t",
+            self.worker_pane,
+            capture=True,
+        ).stdout
+
+    def check_ready_marker(self, item: RunItem) -> bool:
+        captured = self.capture_worker_tail(self.config.ready_check_lines)
+        last_line = last_non_empty_line(captured)
+        matched_marker = ready_marker_match(last_line, self.config.ready_markers)
+        checked_at = datetime.now().isoformat(timespec="seconds")
+        self.last_ready_check_line = last_line
+        self.last_ready_check_at = checked_at
+        self.ready_detected = bool(matched_marker)
+        write_json(
+            self.config.runtime_dir / "last-ready-check.json",
+            {
+                "checked_at": checked_at,
+                "run_index": item.index,
+                "agent": item.agent_name,
+                "last_line": last_line,
+                "matched": bool(matched_marker),
+                "matched_marker": matched_marker,
+            },
+        )
+        return bool(matched_marker)
+
+    def sleep_with_controls(self, seconds: int, phase: str, ready_item: RunItem | None = None) -> str:
+        if ready_item is not None:
+            return self.wait_for_ready_or_timeout(seconds, phase, ready_item)
         deadline = time.time() + max(0, seconds)
         while True:
             remaining = int(round(deadline - time.time()))
@@ -675,7 +747,7 @@ class Controller:
                 self.remaining_seconds = None
                 self.phase = phase
                 self.render()
-                return
+                return "elapsed"
             self.phase = phase
             self.remaining_seconds = remaining
             self.render()
@@ -684,8 +756,36 @@ class Controller:
                 self.remaining_seconds = None
                 self.phase = f"{phase} finished early"
                 self.render()
-                return
+                return "finish"
             time.sleep(min(1, remaining))
+
+    def wait_for_ready_or_timeout(self, seconds: int, phase: str, ready_item: RunItem) -> str:
+        deadline = time.time() + max(0, seconds)
+        next_ready_check = time.time() + max(1, self.config.ready_check_seconds)
+        while True:
+            remaining = int(round(deadline - time.time()))
+            if remaining <= 0:
+                self.remaining_seconds = None
+                self.phase = phase
+                self.render()
+                return "elapsed"
+            self.phase = phase
+            self.remaining_seconds = remaining
+            self.render()
+            self.handle_keyboard()
+            if consume_finish_current_sleep(self.config.runtime_dir):
+                self.remaining_seconds = None
+                self.phase = f"{phase} finished early"
+                self.render()
+                return "finish"
+            if time.time() >= next_ready_check:
+                if self.check_ready_marker(ready_item):
+                    self.remaining_seconds = None
+                    self.phase = f"{phase} ready"
+                    self.render()
+                    return "ready"
+                next_ready_check = time.time() + max(1, self.config.ready_check_seconds)
+            time.sleep(1)
 
     def handle_keyboard(self) -> None:
         while select.select([sys.stdin], [], [], 0)[0]:
@@ -714,6 +814,9 @@ class Controller:
                 "stop_after_current": should_stop_after_current(self.config.runtime_dir),
                 "finish_current_sleep": should_finish_current_sleep(self.config.runtime_dir),
                 "remaining_seconds": self.remaining_seconds,
+                "ready_detected": self.ready_detected,
+                "last_ready_check_line": self.last_ready_check_line,
+                "last_ready_check_at": self.last_ready_check_at,
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             },
         )

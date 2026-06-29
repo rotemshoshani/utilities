@@ -45,7 +45,6 @@ class PromptQueueTests(unittest.TestCase):
                     {
                         "project_dir": "/tmp/project",
                         "command": "cdx",
-                        "run_seconds": 2700,
                         "startup_wait_seconds": 12,
                         "ready_check_seconds": 30,
                         "ready_check_lines": 2,
@@ -66,7 +65,6 @@ class PromptQueueTests(unittest.TestCase):
 
             self.assertEqual(config.project_dir, Path("/tmp/project"))
             self.assertEqual(config.command, "cdx")
-            self.assertEqual(config.run_seconds, 2700)
             self.assertEqual(config.startup_wait_seconds, 12)
             self.assertEqual(config.ready_check_seconds, 30)
             self.assertEqual(config.ready_check_lines, 2)
@@ -336,7 +334,7 @@ class PromptQueueTests(unittest.TestCase):
         self.assertIn("second #2 ... in progress", status)
         self.assertIn("third #3 ... queued", status)
         self.assertIn("[S] stop after current: armed", status)
-        self.assertIn("[F] finish current sleep", status)
+        self.assertIn("[F] finish current wait", status)
 
     def test_should_stop_after_current_reads_flag_file(self) -> None:
         from tempfile import TemporaryDirectory
@@ -526,6 +524,51 @@ class PromptQueueTests(unittest.TestCase):
 
             self.assertEqual(result, "ready")
             self.assertFalse(controller.block_detected)
+
+    def test_worker_wait_uses_ready_marker_without_timeout(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        class FakeController(Controller):
+            def __init__(self, *args: object) -> None:
+                super().__init__(*args)
+                self.calls = 0
+
+            def check_ready_marker(self, item: RunItem) -> str:
+                self.calls += 1
+                return "ready" if self.calls == 2 else "waiting"
+
+            def handle_keyboard(self) -> None:
+                return None
+
+            def render(self) -> None:
+                return None
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            config_path = tmp_path / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "project_dir": "/tmp/project",
+                        "ready_check_seconds": 1,
+                        "prompts": ["prompt"],
+                    }
+                )
+            )
+            config = load_config(config_path, runtime_dir_override=tmp_path / "runtime")
+            controller = FakeController(config, "session", "%1")
+
+            with (
+                mock.patch.object(prompt_queue.time, "sleep"),
+                mock.patch.object(prompt_queue.time, "time", side_effect=[0, 0, 1, 1, 2]),
+            ):
+                result = controller.wait_for_worker_ready(
+                    "agent working",
+                    RunItem(index=1, prompt_name="prompt-1", prompt_text="prompt", prompt_source="test", command="cdx"),
+                )
+
+            self.assertEqual(result, "ready")
+            self.assertEqual(controller.calls, 2)
 
     def test_recovery_marker_waits_for_ready_before_proceeding(self) -> None:
         from tempfile import TemporaryDirectory

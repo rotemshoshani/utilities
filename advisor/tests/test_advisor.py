@@ -17,13 +17,18 @@ from advisor import (
     consume_finish_current_sleep,
     default_work_base_dir,
     latest_runtime_dir,
+    last_non_empty_line,
     load_config,
     make_runtime_dir,
+    ready_marker_match,
     render_prompt,
     render_status,
     resolve_config,
+    select_models,
+    should_check_ready_for_item,
     should_finish_current_sleep,
     should_stop_after_current,
+    topic_raw_for,
 )
 
 
@@ -35,6 +40,10 @@ class AdvisorTests(unittest.TestCase):
         self.assertEqual(config.work_dir_name, "arch-advisor")
         self.assertEqual(config.num_runs, 3)
         self.assertEqual(config.run_seconds, 1500)
+        self.assertEqual(config.ready_check_seconds, 60)
+        self.assertEqual(config.ready_check_lines, 1)
+        self.assertEqual(config.ready_markers, ("Ready",))
+        self.assertEqual(config.ready_command_names, ("codex",))
         self.assertEqual([agent.name for agent in config.agents], ["codex-Codex-default", "claude-Claude-default"])
         self.assertEqual([agent.command for agent in config.agents], ["cdx", "cld"])
         self.assertEqual(config.agents[0].prompt_delivery, "argument_file")
@@ -50,6 +59,24 @@ class AdvisorTests(unittest.TestCase):
         self.assertEqual([agent.name for agent in config.agents], ["claude-claude-fable-5"])
         self.assertEqual(config.agents[0].command, "cld --model claude-fable-5")
         self.assertEqual(config.agents[0].model_label, "Claude Fable 5")
+
+    def test_sec_model_picker_includes_openai_models(self) -> None:
+        from unittest.mock import patch
+
+        raw = json.loads((Path(__file__).parents[1] / "config.json").read_text())
+        topic_raw = topic_raw_for(raw, "sec")
+        labels_seen: list[str] = []
+
+        def fake_select(prompt: str, options: list[tuple[str, str]], multi: bool = False) -> list[str]:
+            nonlocal labels_seen
+            labels_seen = [label for label, _ in options]
+            return ["codex:2"]
+
+        with patch("advisor.fzf_select", side_effect=fake_select):
+            agents = select_models(raw, topic_raw)
+
+        self.assertTrue(any("OpenAI GPT-5.5" in label for label in labels_seen))
+        self.assertEqual([agent.command for agent in agents], ["cdx --model gpt-5.5"])
 
     def test_custom_prompt_puts_task_before_operational_instructions(self) -> None:
         raw = json.loads((Path(__file__).parents[1] / "config.json").read_text())
@@ -74,6 +101,27 @@ class AdvisorTests(unittest.TestCase):
         self.assertEqual(agent.command, "cdx --model gpt-5.4-mini")
         self.assertEqual(agent.prompt_delivery, "argument_file")
 
+    def test_ready_marker_helpers_detect_codex_ready(self) -> None:
+        codex_item = RunItem(
+            index=1,
+            cycle=1,
+            agent_name="codex-gpt-5.5",
+            command="cdx --model gpt-5.5",
+            command_name="codex",
+        )
+        claude_item = RunItem(
+            index=2,
+            cycle=1,
+            agent_name="claude-sonnet",
+            command="cld --model claude-sonnet-4-6",
+            command_name="claude",
+        )
+
+        self.assertEqual(last_non_empty_line("working\n\nReady\n"), "Ready")
+        self.assertEqual(ready_marker_match("status: Ready", ("Ready",)), "Ready")
+        self.assertTrue(should_check_ready_for_item(codex_item, ("codex",)))
+        self.assertFalse(should_check_ready_for_item(claude_item, ("codex",)))
+
     def test_build_run_queue_repeats_each_agent_for_num_runs(self) -> None:
         from tempfile import TemporaryDirectory
 
@@ -86,6 +134,10 @@ class AdvisorTests(unittest.TestCase):
                         "project_dir": "/repo",
                         "runtime_dir": "/repo/.planning/work/advisor/run",
                         "num_runs": 2,
+                        "ready_check_seconds": 15,
+                        "ready_check_lines": 2,
+                        "ready_markers": ["Ready", "Done"],
+                        "ready_command_names": ["codex", "other"],
                         "agents": [
                             {"name": "claude", "command": "claude --model default"},
                             {"name": "codex", "command": "codex"},
@@ -94,7 +146,8 @@ class AdvisorTests(unittest.TestCase):
                 )
             )
 
-            queue = build_run_queue(load_config(config_path))
+            config = load_config(config_path)
+            queue = build_run_queue(config)
 
             self.assertEqual(
                 [(item.index, item.agent_name, item.command) for item in queue],
@@ -105,6 +158,10 @@ class AdvisorTests(unittest.TestCase):
                     (4, "codex", "codex"),
                 ],
             )
+            self.assertEqual(config.ready_check_seconds, 15)
+            self.assertEqual(config.ready_check_lines, 2)
+            self.assertEqual(config.ready_markers, ("Ready", "Done"))
+            self.assertEqual(config.ready_command_names, ("codex", "other"))
 
     def test_build_run_queue_appends_reviewer_after_cycles(self) -> None:
         raw = json.loads((Path(__file__).parents[1] / "config.json").read_text())

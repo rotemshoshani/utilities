@@ -4,8 +4,9 @@ Autonomous tmux runner for feeding a queue of prompts to an agent one at a time.
 
 It opens a tmux session with a controller pane and a worker pane. For each
 prompt, the controller starts a fresh agent process, sends that prompt as the
-initial CLI prompt, waits up to 45 minutes, captures the worker pane, stops
-the agent by respawning the worker pane, and continues to the next prompt.
+initial CLI prompt, waits until the worker pane is `Ready`, captures the worker
+pane, stops the agent by respawning the worker pane, and continues to the next
+prompt.
 
 When blocked recovery is enabled, it also opens a planner pane. If an executor
 finishes with `DO-NOT-PROCEED`, the controller resumes the configured planner
@@ -98,8 +99,7 @@ Reattach:
 ./prompt-queue attach
 ```
 
-Finish the current 45-minute sleep immediately and continue to capture/next
-prompt:
+Finish the current wait immediately and continue to capture/next prompt:
 
 ```bash
 ./prompt-queue finish-sleep
@@ -130,7 +130,7 @@ Focus the controller pane and press:
 | Key | Action |
 | --- | --- |
 | `S` | Stop after the current prompt finishes |
-| `F` | Finish the current sleep immediately |
+| `F` | Finish the current wait immediately |
 | `Q` | Kill the tmux session now |
 
 ## Config
@@ -178,8 +178,8 @@ JSON does not allow raw multi-line string literals. Use one of these instead:
 ```
 
 During the agent working phase, the controller samples the worker pane tail
-once per minute. If the last captured row contains `Ready`, it captures the
-run and advances immediately instead of waiting out the full 45 minutes.
+once per minute by default. When the last captured row contains `Ready`, it
+captures the run and advances. There is no automatic prompt timeout.
 
 After `Ready` is detected, the controller also checks recent output for an
 exact line matching `DO-NOT-PROCEED`. If found, it writes the capture, records
@@ -195,7 +195,6 @@ Blocked recovery settings:
 - `blocked_recovery_human_marker`: exact human-needed line, default `HUMAN-DECISION-REQUIRED`
 - `blocked_recovery_action`: `retry` or `continue`, default `retry`
 - `blocked_recovery_max_attempts`: recovery attempts per prompt, default `1`
-- `blocked_recovery_run_seconds`: recovery timeout, default `2700`
 - `blocked_recovery_check_lines`: recent planner rows to scan after `Ready`, default `20`
 
 With the default `retry` action, a successful recovery retries the blocked
@@ -208,7 +207,6 @@ Completion notification settings:
 - `completion_notify`: resume the planner after all prompts finish, default `false`
 - `completion_notify_session_id`: Codex session id to resume; defaults to `blocked_recovery_session_id`
 - `completion_notify_command`: command used for completion verification; defaults to `blocked_recovery_command` or `cdx`
-- `completion_notify_run_seconds`: completion verification timeout, default `2700`
 - `completion_notify_check_lines`: reserved recent planner rows setting, default `20`
 
 Completion notification has no proceed marker. The controller waits for the

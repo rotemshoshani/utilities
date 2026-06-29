@@ -47,7 +47,6 @@ class Config:
     runtime_dir: Path
     session_name: str
     command: str
-    run_seconds: int
     startup_wait_seconds: int
     capture_lines: int
     history_limit: int
@@ -64,12 +63,10 @@ class Config:
     blocked_recovery_human_marker: str
     blocked_recovery_action: str
     blocked_recovery_max_attempts: int
-    blocked_recovery_run_seconds: int
     blocked_recovery_check_lines: int
     completion_notify: bool
     completion_notify_command: str
     completion_notify_session_id: str
-    completion_notify_run_seconds: int
     completion_notify_check_lines: int
     prompts: tuple[PromptItem, ...]
 
@@ -163,7 +160,6 @@ def load_config(
         runtime_dir=runtime_dir,
         session_name=str(raw.get("session_name", "prompt-queue")),
         command=str(raw.get("command", DEFAULT_CODEX_COMMAND)),
-        run_seconds=int(raw.get("run_seconds", 2700)),
         startup_wait_seconds=int(raw.get("startup_wait_seconds", 10)),
         capture_lines=int(raw.get("capture_lines", 800)),
         history_limit=int(raw.get("history_limit", 200000)),
@@ -180,12 +176,10 @@ def load_config(
         blocked_recovery_human_marker=blocked_recovery_human_marker,
         blocked_recovery_action=blocked_recovery_action,
         blocked_recovery_max_attempts=int(raw.get("blocked_recovery_max_attempts", 1)),
-        blocked_recovery_run_seconds=int(raw.get("blocked_recovery_run_seconds", 2700)),
         blocked_recovery_check_lines=int(raw.get("blocked_recovery_check_lines", 20)),
         completion_notify=completion_notify,
         completion_notify_command=str(raw.get("completion_notify_command", raw.get("blocked_recovery_command", DEFAULT_CODEX_COMMAND))),
         completion_notify_session_id=completion_notify_session_id,
-        completion_notify_run_seconds=int(raw.get("completion_notify_run_seconds", 2700)),
         completion_notify_check_lines=int(raw.get("completion_notify_check_lines", 20)),
         prompts=prompts,
     )
@@ -389,9 +383,9 @@ def render_status(
 
     lines.extend(["", f"phase: {phase}"])
     if remaining_seconds is not None:
-        lines.append(f"sleep remaining: {format_duration(remaining_seconds)}")
+        lines.append(f"wait remaining: {format_duration(remaining_seconds)}")
     lines.append(f"[S] stop after current: {'armed' if stop_after_current else 'off'}")
-    lines.append("[F] finish current sleep")
+    lines.append("[F] finish current wait")
     lines.append("[Q] kill now")
     return "\n".join(lines)
 
@@ -599,7 +593,7 @@ class Controller:
             self.render()
             self.paste_prompt(prompt_file)
 
-        sleep_result = self.sleep_with_controls(self.config.run_seconds, "agent working", ready_item=item)
+        sleep_result = self.wait_for_worker_ready("agent working", item)
         capture_path = self.capture_run(item)
         if sleep_result == "blocked":
             self.phase = "blocked"
@@ -852,22 +846,18 @@ class Controller:
         return prompt_file
 
     def wait_for_blocked_recovery(self, item: RunItem, recovery_attempts: int) -> str:
-        deadline = time.time() + max(0, self.config.blocked_recovery_run_seconds)
         ready_interval = max(1, self.config.ready_check_seconds)
         next_ready_check = time.time() + ready_interval
         while True:
-            remaining = int(round(deadline - time.time()))
-            if remaining <= 0:
-                self.remaining_seconds = None
-                self.phase = "blocked recovery timed out"
-                self.render()
-                return "timeout"
             self.phase = "blocked recovery"
-            self.remaining_seconds = remaining
+            self.remaining_seconds = None
             self.render()
             self.handle_keyboard()
             if consume_finish_current_sleep(self.config.runtime_dir):
-                next_ready_check = time.time()
+                self.remaining_seconds = None
+                self.phase = "blocked recovery finished manually"
+                self.render()
+                return "finish"
             if time.time() >= next_ready_check:
                 result = self.check_recovery_marker(item, recovery_attempts)
                 if result in {"proceed", "human", "ready-without-marker"}:
@@ -876,7 +866,7 @@ class Controller:
                     self.render()
                     return result
                 next_ready_check = time.time() + ready_interval
-            time.sleep(min(1, remaining))
+            time.sleep(1)
 
     def check_recovery_marker(self, item: RunItem, recovery_attempts: int) -> str:
         captured = self.capture_planner_tail(self.config.ready_check_lines)
@@ -996,22 +986,18 @@ class Controller:
         return prompt_file
 
     def wait_for_completion_notify(self) -> str:
-        deadline = time.time() + max(0, self.config.completion_notify_run_seconds)
         ready_interval = max(1, self.config.ready_check_seconds)
         next_ready_check = time.time() + ready_interval
         while True:
-            remaining = int(round(deadline - time.time()))
-            if remaining <= 0:
-                self.remaining_seconds = None
-                self.phase = "completion notify timed out"
-                self.render()
-                return "timeout"
             self.phase = "completion notify"
-            self.remaining_seconds = remaining
+            self.remaining_seconds = None
             self.render()
             self.handle_keyboard()
             if consume_finish_current_sleep(self.config.runtime_dir):
-                next_ready_check = time.time()
+                self.remaining_seconds = None
+                self.phase = "completion notify finished manually"
+                self.render()
+                return "finish"
             if time.time() >= next_ready_check:
                 result = self.check_completion_ready()
                 if result == "ready":
@@ -1020,7 +1006,7 @@ class Controller:
                     self.render()
                     return "ready"
                 next_ready_check = time.time() + ready_interval
-            time.sleep(min(1, remaining))
+            time.sleep(1)
 
     def check_completion_ready(self) -> str:
         captured = self.capture_planner_tail(self.config.ready_check_lines)
@@ -1060,9 +1046,9 @@ class Controller:
         )
 
     def sleep_with_controls(self, seconds: int, phase: str, ready_item: RunItem | None = None) -> str:
+        if ready_item is not None:
+            return self.wait_for_worker_ready(phase, ready_item)
         deadline = time.time() + max(0, seconds)
-        ready_interval = max(0, self.config.ready_check_seconds)
-        next_ready_check = time.time() + ready_interval if ready_item and ready_interval else None
         while True:
             remaining = int(round(deadline - time.time()))
             if remaining <= 0:
@@ -1079,7 +1065,22 @@ class Controller:
                 self.phase = f"{phase} finished early"
                 self.render()
                 return "finish"
-            if ready_item and next_ready_check is not None and time.time() >= next_ready_check:
+            time.sleep(min(1, remaining))
+
+    def wait_for_worker_ready(self, phase: str, ready_item: RunItem) -> str:
+        ready_interval = max(1, self.config.ready_check_seconds)
+        next_ready_check = time.time() + ready_interval
+        while True:
+            self.phase = phase
+            self.remaining_seconds = None
+            self.render()
+            self.handle_keyboard()
+            if consume_finish_current_sleep(self.config.runtime_dir):
+                self.remaining_seconds = None
+                self.phase = f"{phase} finished manually"
+                self.render()
+                return "finish"
+            if time.time() >= next_ready_check:
                 ready_result = self.check_ready_marker(ready_item)
                 if ready_result == "blocked":
                     self.remaining_seconds = None
@@ -1092,7 +1093,7 @@ class Controller:
                     self.render()
                     return "ready"
                 next_ready_check = time.time() + ready_interval
-            time.sleep(min(1, remaining))
+            time.sleep(1)
 
     def handle_keyboard(self) -> None:
         while select.select([sys.stdin], [], [], 0)[0]:
@@ -1327,7 +1328,7 @@ def finish_sleep(args: argparse.Namespace) -> None:
     config = load_config_for_control(args)
     runtime_dir = latest_runtime_dir(config.project_dir)
     (runtime_dir / FINISH_SLEEP_FLAG).write_text("1\n")
-    print(f"armed finish-current-sleep: {runtime_dir / FINISH_SLEEP_FLAG}")
+    print(f"armed finish-current-wait: {runtime_dir / FINISH_SLEEP_FLAG}")
 
 
 def kill(args: argparse.Namespace) -> None:
@@ -1418,7 +1419,7 @@ def build_parser() -> argparse.ArgumentParser:
     stop = sub.add_parser("stop-next", help="finish current prompt, then stop")
     stop.set_defaults(func=stop_next)
 
-    finish = sub.add_parser("finish-sleep", help="finish the current controller sleep immediately")
+    finish = sub.add_parser("finish-sleep", help="finish the current controller wait immediately")
     finish.set_defaults(func=finish_sleep)
 
     kill_cmd = sub.add_parser("kill", help="kill the tmux session now")

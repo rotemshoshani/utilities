@@ -72,6 +72,11 @@ cdx --model gpt-5.5
 The preview prints the full command queue in execution order, including repeated
 cycles. If a reviewer is selected, its final command is shown once at the end.
 
+Codex runs finish early when the worker pane reaches `Ready`. Advisor checks the
+last captured row once per minute by default and proceeds to capture as soon as
+it sees the configured ready marker. Non-Codex runs still use the configured
+sleep duration unless finished manually.
+
 ## Reviewer
 
 The reviewer reads all reports, findings, plans, captures, and supporting files
