@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import select
@@ -20,6 +21,9 @@ DEFAULT_CONFIG = Path(__file__).with_name("config.json")
 DEFAULT_ENV = Path(__file__).with_name(".env.local")
 STOP_NEXT_FLAG = "stop-next.flag"
 FINISH_SLEEP_FLAG = "finish-sleep.flag"
+PROGRESS_FILE = "progress.json"
+TIMINGS_FILE = "timings.jsonl"
+PROMPT_LIST_FILE = "prompt-list.txt"
 TIMESTAMP_FORMAT = "%Y%m%d-%H%M%S"
 NO_MORE_PROMPTS = "no more prompts"
 DEFAULT_PROMPT_END_MARKER = "::end"
@@ -79,6 +83,17 @@ class RunItem:
     prompt_source: str
     command: str
     prompt_delivery: str = "argument_file"
+
+
+@dataclass(frozen=True)
+class RunPlan:
+    project_dir: Path
+    session: str
+    prompt_count: int
+    completed: list[int]
+    pending: list[int]
+    resume_runtime_dir: Path | None
+    existing_session: bool
 
 
 def expand_project_path(value: str, base_dir: Path) -> Path:
@@ -263,15 +278,17 @@ def normalize_prompt_items(items: list[tuple[str, str, str]]) -> list[PromptItem
 def write_prompt_queue(path: Path, prompts: tuple[PromptItem, ...]) -> None:
     write_json(
         path,
-        [
-            {"index": item.index, "name": item.name, "text": item.text, "source": item.source}
-            for item in prompts
-        ],
+        {
+            "version": 1,
+            "queue_id": queue_hash(prompts),
+            "items": [prompt_manifest_item(item) for item in prompts],
+        },
     )
 
 
 def read_prompt_queue(path: Path) -> tuple[PromptItem, ...]:
     raw = json.loads(path.read_text())
+    items = raw.get("items", []) if isinstance(raw, dict) else raw
     return tuple(
         PromptItem(
             index=int(item["index"]),
@@ -279,8 +296,92 @@ def read_prompt_queue(path: Path) -> tuple[PromptItem, ...]:
             text=str(item["text"]),
             source=str(item.get("source", "queue")),
         )
-        for item in raw
+        for item in items
     )
+
+
+def prompt_manifest_item(item: PromptItem) -> dict[str, object]:
+    return {
+        "index": item.index,
+        "name": item.name,
+        "text": item.text,
+        "source": item.source,
+        "content_hash": prompt_content_hash(item),
+    }
+
+
+def prompt_content_hash(item: PromptItem) -> str:
+    payload = json.dumps(
+        {"index": item.index, "name": item.name, "text": item.text},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
+def queue_hash(prompts: tuple[PromptItem, ...]) -> str:
+    payload = json.dumps(
+        [prompt_manifest_item(item) for item in prompts],
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
+def prompt_items_match(left: PromptItem, right: PromptItem) -> bool:
+    return left.index == right.index and left.name == right.name and left.text == right.text
+
+
+def read_completed_indices(runtime_dir: Path) -> set[int]:
+    progress_path = runtime_dir / PROGRESS_FILE
+    state_path = runtime_dir / "state.json"
+    for path in (progress_path, state_path):
+        if not path.exists():
+            continue
+        try:
+            raw = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        completed = raw.get("completed", [])
+        if not isinstance(completed, list):
+            continue
+        return {int(value) for value in completed}
+    return set()
+
+
+def read_resumable_completed_indices(runtime_dir: Path, current_prompts: tuple[PromptItem, ...]) -> set[int]:
+    queue_path = runtime_dir / "queue.json"
+    if not queue_path.exists():
+        return set()
+    try:
+        prior_prompts = read_prompt_queue(queue_path)
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return set()
+
+    current_by_index = {prompt.index: prompt for prompt in current_prompts}
+    prior_by_index = {prompt.index: prompt for prompt in prior_prompts}
+    completed = read_completed_indices(runtime_dir)
+    return {
+        index
+        for index in completed
+        if index in current_by_index
+        and index in prior_by_index
+        and prompt_items_match(current_by_index[index], prior_by_index[index])
+    }
+
+
+def write_progress_snapshot(
+    runtime_dir: Path,
+    completed: set[int],
+    last_finished: dict[str, object] | None = None,
+) -> None:
+    value: dict[str, object] = {
+        "completed": sorted(completed),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    if last_finished is not None:
+        value["last_finished"] = last_finished
+    write_json(runtime_dir / PROGRESS_FILE, value)
 
 
 def build_run_queue(config: Config) -> list[RunItem]:
@@ -315,6 +416,91 @@ def latest_runtime_dir(project_dir: Path) -> Path:
     return candidates[-1]
 
 
+def format_index_ranges(indices: list[int] | set[int] | tuple[int, ...]) -> str:
+    ordered = sorted(set(indices))
+    if not ordered:
+        return "none"
+
+    ranges: list[str] = []
+    start = ordered[0]
+    previous = ordered[0]
+    for value in ordered[1:]:
+        if value == previous + 1:
+            previous = value
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = value
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return ",".join(ranges)
+
+
+def build_run_plan(
+    config: Config,
+    session: str,
+    resume_runtime_dir: Path | None,
+    existing_session: bool,
+    completed: set[int] | None = None,
+) -> RunPlan:
+    completed_indices = sorted(completed if completed is not None else set())
+    pending = [item.index for item in config.prompts if item.index not in completed_indices]
+    return RunPlan(
+        project_dir=config.project_dir,
+        session=session,
+        prompt_count=len(config.prompts),
+        completed=completed_indices,
+        pending=pending,
+        resume_runtime_dir=resume_runtime_dir,
+        existing_session=existing_session,
+    )
+
+
+def render_run_preflight(plan: RunPlan) -> str:
+    lines = [
+        "prompt-queue preflight",
+        "",
+        f"target repo: {plan.project_dir}",
+        f"queue: {plan.prompt_count} prompts",
+        f"resume source: {plan.resume_runtime_dir if plan.resume_runtime_dir else 'none'}",
+        f"completed: {format_index_ranges(plan.completed)}",
+        f"will run: {format_index_ranges(plan.pending)}",
+    ]
+    if plan.existing_session:
+        lines.append(f"existing tmux session: {plan.session}")
+    else:
+        lines.append("existing tmux session: none")
+    return "\n".join(lines)
+
+
+def tmux_session_exists(session: str) -> bool:
+    return tmux("has-session", "-t", session, check=False, capture=True).returncode == 0
+
+
+def prompt_existing_session_action(plan: RunPlan) -> str:
+    print(render_run_preflight(plan))
+    print("")
+    while True:
+        choice = input("Existing tmux session found. [a]ttach, [r]eplace, [q]uit? ").strip().lower()
+        if choice in {"", "a", "attach"}:
+            return "attach"
+        if choice in {"r", "replace"}:
+            return "replace"
+        if choice in {"q", "quit"}:
+            return "quit"
+        print("Choose a, r, or q.")
+
+
+def prompt_start_new_run(plan: RunPlan) -> bool:
+    print(render_run_preflight(plan))
+    print("")
+    while True:
+        choice = input("Start this run? [Y/n] ").strip().lower()
+        if choice in {"", "y", "yes"}:
+            return True
+        if choice in {"n", "no", "q", "quit"}:
+            return False
+        print("Choose y or n.")
+
+
 def build_worker_cd_command(project_dir: Path) -> str:
     return f"cd -- {sh_quote(str(project_dir))}"
 
@@ -325,6 +511,18 @@ def build_prompt_argument_command(command: str, prompt_file: Path) -> str:
 
 def build_resume_prompt_command(command: str, session_id: str, prompt_file: Path) -> str:
     return f"{command} resume {sh_quote(session_id)} \"$(cat {sh_quote(str(prompt_file))})\""
+
+
+def build_prompt_list_watch_command(prompt_list_file: Path) -> str:
+    quoted_path = sh_quote(str(prompt_list_file))
+    return (
+        "while true; do "
+        "printf '\\033[2J\\033[H'; "
+        f"if [ -f {quoted_path} ]; then cat {quoted_path}; "
+        "else printf 'Prompt List\\n\\nwaiting for controller...\\n'; fi; "
+        "sleep 1; "
+        "done"
+    )
 
 
 def apply_agent_override(config: Config, use_claude: bool) -> Config:
@@ -351,6 +549,15 @@ def should_stop_after_current(runtime_dir: Path) -> bool:
     return (runtime_dir / STOP_NEXT_FLAG).exists()
 
 
+def toggle_stop_after_current(runtime_dir: Path) -> bool:
+    flag = runtime_dir / STOP_NEXT_FLAG
+    if flag.exists():
+        flag.unlink(missing_ok=True)
+        return False
+    flag.write_text("1\n")
+    return True
+
+
 def should_finish_current_sleep(runtime_dir: Path) -> bool:
     return (runtime_dir / FINISH_SLEEP_FLAG).exists()
 
@@ -370,24 +577,127 @@ def render_status(
     stop_after_current: bool,
     phase: str = "idle",
     remaining_seconds: int | None = None,
+    total_elapsed_seconds: int | None = None,
+    prompt_elapsed_seconds: int | None = None,
+    last_check_at: str | None = None,
+    last_check_line: str | None = None,
+    prompt_durations: dict[int, float] | None = None,
+    title: str = "",
+    completed_window: int = 3,
+    queued_window: int = 8,
 ) -> str:
-    lines = ["prompt-queue", ""]
-    for item in queue:
-        if item.index in completed:
-            marker = "V"
-        elif current_index == item.index:
-            marker = "in progress"
-        else:
-            marker = "queued"
-        lines.append(f"{item.prompt_name} #{item.index} ... {marker}")
+    prompt_durations = prompt_durations or {}
+    current_item = next((item for item in queue if item.index == current_index), None)
+    total = len(queue)
+    done = len(completed)
+    left = sum(1 for item in queue if item.index not in completed and item.index != current_index)
+    elapsed = format_elapsed(total_elapsed_seconds or 0)
+    header_title = f"prompt-queue  {title}" if title else "prompt-queue"
+    current_label = f"{current_item.index:03d} {current_item.prompt_name}" if current_item else "none"
 
-    lines.extend(["", f"phase: {phase}"])
+    lines = [
+        f"{header_title}  running  {elapsed}",
+        "",
+        "Progress",
+        f"  done     {done}/{total}",
+        f"  current  {current_label}",
+        f"  left     {left}",
+    ]
+
+    lines.extend(
+        [
+            "",
+            "Current Prompt",
+            f"  phase       {phase}",
+            f"  elapsed     {format_elapsed(prompt_elapsed_seconds) if prompt_elapsed_seconds is not None else '-'}",
+            f"  last check  {format_status_time(last_check_at)}",
+            f"  last line   {last_check_line or '-'}",
+        ]
+    )
     if remaining_seconds is not None:
-        lines.append(f"wait remaining: {format_duration(remaining_seconds)}")
-    lines.append(f"[S] stop after current: {'armed' if stop_after_current else 'off'}")
-    lines.append("[F] finish current wait")
-    lines.append("[Q] kill now")
+        lines.append(f"  wait        {format_duration(remaining_seconds)}")
+    if stop_after_current:
+        lines.append("  stop next   armed")
+    lines.extend(["", "Controls", "  S stop after current    F finish wait    Q kill now"])
     return "\n".join(lines)
+
+
+def render_prompt_list(
+    queue: list[RunItem],
+    current_index: int | None,
+    completed: set[int],
+    prompt_durations: dict[int, float] | None = None,
+    prompt_elapsed_seconds: int | None = None,
+    completed_window: int = 9999,
+    queued_window: int = 9999,
+) -> str:
+    prompt_durations = prompt_durations or {}
+    lines = ["Prompt List", ""]
+    lines.extend(
+        render_queue_rows(
+            queue,
+            current_index,
+            completed,
+            prompt_durations,
+            prompt_elapsed_seconds,
+            completed_window,
+            queued_window,
+        )
+    )
+    return "\n".join(lines)
+
+
+def render_queue_rows(
+    queue: list[RunItem],
+    current_index: int | None,
+    completed: set[int],
+    prompt_durations: dict[int, float],
+    prompt_elapsed_seconds: int | None,
+    completed_window: int,
+    queued_window: int,
+) -> list[str]:
+    rows: list[str] = []
+    completed_items = [item for item in queue if item.index in completed]
+    hidden_completed = max(0, len(completed_items) - max(0, completed_window))
+    shown_completed = completed_items[-completed_window:] if completed_window > 0 else []
+    for item in shown_completed:
+        rows.append(render_queue_row("x", item, prompt_durations.get(item.index)))
+    if hidden_completed:
+        rows.insert(0, f"      ... {hidden_completed} completed prompts hidden")
+
+    current_item = next((item for item in queue if item.index == current_index), None)
+    if current_item is not None:
+        rows.append(render_queue_row(">", current_item, None))
+
+    queued_items = [item for item in queue if item.index not in completed and item.index != current_index]
+    shown_queued = queued_items[: max(0, queued_window)]
+    for item in shown_queued:
+        rows.append(render_queue_row(" ", item, None))
+    hidden_queued = max(0, len(queued_items) - len(shown_queued))
+    if hidden_queued:
+        rows.append(f"      ... {hidden_queued} queued prompts hidden")
+
+    if not rows:
+        rows.append("  none")
+    return rows
+
+
+def render_queue_row(marker: str, item: RunItem, duration_seconds: float | int | None) -> str:
+    label = f"[{marker}] {item.index:03d} {item.prompt_name}"
+    duration = format_elapsed(int(duration_seconds)) if duration_seconds is not None else ""
+    return f"  {label:<58} {duration}".rstrip()
+
+
+def format_status_time(value: str | None) -> str:
+    if not value:
+        return "-"
+    if "T" in value:
+        return value.split("T", 1)[1][:8]
+    return value
+
+
+def format_elapsed(seconds: int) -> str:
+    return format_duration(seconds)
 
 
 def format_duration(seconds: int) -> str:
@@ -496,14 +806,20 @@ class Controller:
         self.worker_pane = worker_pane
         self.planner_pane = planner_pane
         self.queue = build_run_queue(config)
-        self.completed: set[int] = set()
+        self.completed: set[int] = read_resumable_completed_indices(config.runtime_dir, config.prompts)
         self.current_index: int | None = None
         self.phase = "starting"
         self.remaining_seconds: int | None = None
+        self.run_started_at = time.monotonic()
+        self.run_started_wall_at = datetime.now().isoformat(timespec="seconds")
+        self.current_prompt_started_at: float | None = None
+        self.current_prompt_started_wall_at: str | None = None
+        self.prompt_durations: dict[int, float] = {}
         self.last_ready_check_line: str | None = None
         self.last_ready_check_at: str | None = None
         self.ready_detected = False
         self.prompt_dir = config.runtime_dir / "prompts"
+        self.prompt_list_file = config.runtime_dir / PROMPT_LIST_FILE
         self.capture_dir = config.runtime_dir / "captures"
         self.ready_check_dir = config.runtime_dir / "ready-checks"
         self.recovery_prompt_dir = config.runtime_dir / "recovery-prompts"
@@ -534,9 +850,13 @@ class Controller:
         self.completion_prompt_dir.mkdir(parents=True, exist_ok=True)
         self.completion_check_dir.mkdir(parents=True, exist_ok=True)
         write_json(self.config.runtime_dir / "controller.json", {"pid": os.getpid(), "session": self.session})
+        write_progress_snapshot(self.config.runtime_dir, self.completed)
         self.render()
 
+        ran_prompt = False
         for item in self.queue:
+            if item.index in self.completed:
+                continue
             recovery_attempts = 0
             while True:
                 if should_stop_after_current(self.config.runtime_dir):
@@ -544,12 +864,16 @@ class Controller:
                     self.current_index = None
                     self.render()
                     return
+                ran_prompt = True
                 result = self.run_one(item, recovery_attempts)
                 if result == "complete":
                     break
                 if result == "continue":
                     self.completed.add(item.index)
+                    self.record_prompt_finished(item, "continue")
                     self.current_index = None
+                    self.current_prompt_started_at = None
+                    self.current_prompt_started_wall_at = None
                     self.phase = "continued after recovery"
                     self.remaining_seconds = None
                     self.stop_worker()
@@ -564,7 +888,7 @@ class Controller:
                 return
 
         self.current_index = None
-        if self.config.completion_notify:
+        if self.config.completion_notify and ran_prompt:
             self.notify_completion()
         self.phase = "complete"
         self.remaining_seconds = None
@@ -572,6 +896,8 @@ class Controller:
 
     def run_one(self, item: RunItem, recovery_attempts: int = 0) -> str:
         self.current_index = item.index
+        self.current_prompt_started_at = time.monotonic()
+        self.current_prompt_started_wall_at = datetime.now().isoformat(timespec="seconds")
         self.phase = "launching"
         self.remaining_seconds = None
         self.render()
@@ -604,13 +930,38 @@ class Controller:
             if recovery_result in {"retry", "continue"}:
                 return recovery_result
             return "blocked"
-        self.stop_worker()
+        if not should_stop_after_current(self.config.runtime_dir):
+            self.stop_worker()
         self.completed.add(item.index)
+        self.record_prompt_finished(item, "complete")
         self.current_index = None
+        self.current_prompt_started_at = None
+        self.current_prompt_started_wall_at = None
         self.phase = "captured"
         self.remaining_seconds = None
         self.render()
         return "complete"
+
+    def record_prompt_finished(self, item: RunItem, status: str) -> None:
+        finished_at = datetime.now().isoformat(timespec="seconds")
+        duration_seconds = None
+        if self.current_prompt_started_at is not None:
+            duration_seconds = round(time.monotonic() - self.current_prompt_started_at, 2)
+        entry: dict[str, object] = {
+            "run_index": item.index,
+            "name": item.prompt_name,
+            "source": item.prompt_source,
+            "status": status,
+            "started_at": self.current_prompt_started_wall_at,
+            "finished_at": finished_at,
+            "duration_seconds": duration_seconds,
+        }
+        self.config.runtime_dir.mkdir(parents=True, exist_ok=True)
+        with (self.config.runtime_dir / TIMINGS_FILE).open("a") as handle:
+            handle.write(json.dumps(entry, sort_keys=True) + "\n")
+        if duration_seconds is not None:
+            self.prompt_durations[item.index] = duration_seconds
+        write_progress_snapshot(self.config.runtime_dir, self.completed, entry)
 
     def recycle_worker(self) -> None:
         if tmux_target_exists(self.worker_pane):
@@ -1102,7 +1453,7 @@ class Controller:
                 tmux("kill-session", "-t", self.session, check=False)
                 raise SystemExit(0)
             if key in {"s", "S"}:
-                (self.config.runtime_dir / STOP_NEXT_FLAG).write_text("1\n")
+                toggle_stop_after_current(self.config.runtime_dir)
                 self.render()
             if key in {"f", "F"}:
                 (self.config.runtime_dir / FINISH_SLEEP_FLAG).write_text("1\n")
@@ -1138,6 +1489,21 @@ class Controller:
             },
         )
         print("\033[2J\033[H", end="")
+        total_elapsed = int(time.monotonic() - self.run_started_at)
+        prompt_elapsed = (
+            int(time.monotonic() - self.current_prompt_started_at)
+            if self.current_prompt_started_at is not None
+            else None
+        )
+        self.prompt_list_file.write_text(
+            render_prompt_list(
+                self.queue,
+                self.current_index,
+                self.completed,
+                self.prompt_durations,
+            )
+            + "\n"
+        )
         print(
             render_status(
                 self.queue,
@@ -1146,6 +1512,12 @@ class Controller:
                 should_stop_after_current(self.config.runtime_dir),
                 self.phase,
                 self.remaining_seconds,
+                total_elapsed,
+                prompt_elapsed,
+                self.last_ready_check_at,
+                self.last_ready_check_line,
+                self.prompt_durations,
+                self.config.project_dir.name,
             ),
             flush=True,
         )
@@ -1192,18 +1564,46 @@ def start_session(args: argparse.Namespace) -> None:
     if not config.project_dir.is_dir():
         raise SystemExit(f"project_dir does not exist: {config.project_dir}")
 
+    resume_completed: set[int] = set()
+    resume_runtime_dir: Path | None = None
+    try:
+        resume_runtime_dir = latest_runtime_dir(config.project_dir)
+        resume_completed = read_resumable_completed_indices(resume_runtime_dir, config.prompts)
+    except SystemExit:
+        resume_completed = set()
+
+    session = args.session or f"{config.session_name}-{sanitize_name(config.project_dir.name)}"
+    existing_session = tmux_session_exists(session)
+    plan = build_run_plan(config, session, resume_runtime_dir, existing_session, resume_completed)
+    if existing_session:
+        action = prompt_existing_session_action(plan) if sys.stdin.isatty() else "attach"
+        if action == "attach":
+            attach_session(session)
+            return
+        if action == "quit":
+            return
+    else:
+        if sys.stdin.isatty() and not prompt_start_new_run(plan):
+            return
+        if not sys.stdin.isatty():
+            print(render_run_preflight(plan))
+            print("")
+
     config.runtime_dir.mkdir(parents=True, exist_ok=True)
     (config.runtime_dir / STOP_NEXT_FLAG).unlink(missing_ok=True)
     (config.runtime_dir / FINISH_SLEEP_FLAG).unlink(missing_ok=True)
     queue_file = config.runtime_dir / "queue.json"
     write_prompt_queue(queue_file, config.prompts)
+    write_progress_snapshot(config.runtime_dir, resume_completed)
 
-    session = args.session or f"{config.session_name}-{sanitize_name(config.project_dir.name)}"
-    kill_tmux_session_if_exists(session)
+    if existing_session:
+        kill_tmux_session_if_exists(session)
 
     term_w = str(shutil.get_terminal_size((200, 50)).columns)
     term_h = str(shutil.get_terminal_size((200, 50)).lines)
     script = Path(__file__).resolve()
+    prompt_list_file = config.runtime_dir / PROMPT_LIST_FILE
+    prompt_list_file.write_text("Prompt List\n\nstarting controller...\n")
 
     controller_id = tmux(
         "new-session",
@@ -1224,13 +1624,30 @@ def start_session(args: argparse.Namespace) -> None:
         "bash",
         capture=True,
     ).stdout.strip()
+    prompt_list_id = tmux(
+        "split-window",
+        "-t",
+        controller_id,
+        "-h",
+        "-c",
+        str(config.project_dir),
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "bash",
+        capture=True,
+    ).stdout.strip()
+    tmux("send-keys", "-t", prompt_list_id, build_prompt_list_watch_command(prompt_list_file), "Enter")
+
     planner_id = ""
     if config.blocked_recovery or config.completion_notify:
         planner_id = tmux(
             "split-window",
             "-t",
             controller_id,
-            "-h",
+            "-v",
+            "-p",
+            "75",
             "-c",
             str(config.project_dir),
             "-P",
@@ -1242,8 +1659,10 @@ def start_session(args: argparse.Namespace) -> None:
     worker_id = tmux(
         "split-window",
         "-t",
-        controller_id,
+        prompt_list_id,
         "-v",
+        "-p",
+        "75",
         "-c",
         str(config.project_dir),
         "-P",
@@ -1278,6 +1697,7 @@ def start_session(args: argparse.Namespace) -> None:
         {
             "session": session,
             "worker_pane": worker_id,
+            "prompt_list_pane": prompt_list_id,
             "planner_pane": planner_id,
             "project_dir": str(config.project_dir),
             "runtime_dir": str(config.runtime_dir),
@@ -1320,8 +1740,9 @@ def load_config_for_control(args: argparse.Namespace) -> Config:
 def stop_next(args: argparse.Namespace) -> None:
     config = load_config_for_control(args)
     runtime_dir = latest_runtime_dir(config.project_dir)
-    (runtime_dir / STOP_NEXT_FLAG).write_text("1\n")
-    print(f"armed stop-after-current: {runtime_dir / STOP_NEXT_FLAG}")
+    armed = toggle_stop_after_current(runtime_dir)
+    state = "armed" if armed else "disarmed"
+    print(f"{state} stop-after-current: {runtime_dir / STOP_NEXT_FLAG}")
 
 
 def finish_sleep(args: argparse.Namespace) -> None:

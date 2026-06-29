@@ -40,8 +40,18 @@ instead, using `cld` and interactive paste delivery:
 ./prompt-queue run --cld
 ```
 
-Starting a run kills the existing tmux session for this prompt queue if one is
-already present, then creates a fresh session.
+Starting a run shows a preflight summary before tmux launch. If a tmux session
+for the same prompt queue already exists, prompt-queue asks whether to attach to
+it, replace it with a new run, or quit. In non-interactive shells, the safe
+default is to attach to the existing session instead of replacing it.
+
+When a run starts, prompt-queue looks at the latest compatible run under the
+target repo's `.planning/work/prompt-queue/` directory. Completed prompts are
+skipped automatically, so if a tmux session exits or is stopped after prompt 5,
+the next `./prompt-queue run` starts from prompt 6 without editing
+`config.json`. Compatibility is checked against the saved `queue.json`,
+including prompt content hashes, so a changed prompt is not skipped by stale
+progress.
 
 To build the prompt queue interactively:
 
@@ -105,7 +115,9 @@ Finish the current wait immediately and continue to capture/next prompt:
 ./prompt-queue finish-sleep
 ```
 
-Finish the current prompt and stop before the next prompt:
+Toggle stopping after the current prompt. When armed, prompt-queue finishes the
+current prompt, leaves the worker pane open on the completed agent, and stops
+before the next prompt:
 
 ```bash
 ./prompt-queue stop-next
@@ -125,11 +137,16 @@ Print controller state:
 
 ## Controller Keys
 
+New runs split the tmux window into two columns:
+
+- left: short `controller` pane above the resumed planner/recovery agent pane
+- right: short `prompt list` pane above the executor/worker pane
+
 Focus the controller pane and press:
 
 | Key | Action |
 | --- | --- |
-| `S` | Stop after the current prompt finishes |
+| `S` | Toggle stop after the current prompt finishes |
 | `F` | Finish the current wait immediately |
 | `Q` | Kill the tmux session now |
 
@@ -217,6 +234,16 @@ Readiness samples are written to:
 ```bash
 <project>/.planning/work/prompt-queue/<YYYYMMDD-HHMMSS>/ready-checks/
 ```
+
+Progress and timing files are written to each run directory:
+
+- `queue.json`: the queue snapshot, including queue and prompt content hashes
+- `progress.json`: completed prompt indices and the last finished prompt
+- `timings.jsonl`: one JSON record per finished prompt with start time, finish
+  time, duration, and status
+
+The controller pane also shows total running time and the current prompt's
+elapsed time while a prompt is active.
 
 `prompt_delivery: "argument_file"` writes each prompt to:
 

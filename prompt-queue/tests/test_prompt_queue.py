@@ -11,21 +11,31 @@ from prompt_queue import (
     RunItem,
     apply_agent_override,
     build_prompt_argument_command,
+    build_prompt_list_watch_command,
     build_resume_prompt_command,
     build_run_queue,
     build_worker_cd_command,
     consume_finish_current_sleep,
     default_work_base_dir,
+    format_elapsed,
+    format_index_ranges,
     kill_tmux_session_if_exists,
     latest_runtime_dir,
     load_env_file,
     load_config,
     make_runtime_dir,
     paste_settle_seconds,
+    read_resumable_completed_indices,
     read_prompt_queue,
+    render_prompt_list,
+    render_run_preflight,
     render_status,
+    prompt_start_new_run,
+    RunPlan,
     should_finish_current_sleep,
     should_stop_after_current,
+    stop_next,
+    toggle_stop_after_current,
     write_collected_prompts,
     write_prompt_queue,
 )
@@ -168,6 +178,45 @@ class PromptQueueTests(unittest.TestCase):
             write_prompt_queue(queue_path, prompts)
 
             self.assertEqual(read_prompt_queue(queue_path), prompts)
+
+    def test_write_prompt_queue_includes_hash_manifest(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            config_path = Path(raw_dir) / "config.json"
+            queue_path = Path(raw_dir) / "queue.json"
+            config_path.write_text(json.dumps({"prompts": ["one", "two"]}))
+            prompts = load_config(config_path).prompts
+
+            write_prompt_queue(queue_path, prompts)
+
+            raw = json.loads(queue_path.read_text())
+            self.assertEqual(raw["version"], 1)
+            self.assertTrue(str(raw["queue_id"]).startswith("sha256:"))
+            self.assertEqual(len(raw["items"]), 2)
+            self.assertTrue(str(raw["items"][0]["content_hash"]).startswith("sha256:"))
+            self.assertEqual(read_prompt_queue(queue_path), prompts)
+
+    def test_read_prompt_queue_keeps_legacy_list_compatibility(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            queue_path = Path(raw_dir) / "queue.json"
+            queue_path.write_text(
+                json.dumps(
+                    [
+                        {"index": 1, "name": "first", "text": "Prompt one", "source": "config"},
+                        {"index": 2, "name": "second", "text": "Prompt two", "source": "config"},
+                    ]
+                )
+            )
+
+            prompts = read_prompt_queue(queue_path)
+
+            self.assertEqual([(item.index, item.name, item.text) for item in prompts], [
+                (1, "first", "Prompt one"),
+                (2, "second", "Prompt two"),
+            ])
 
     def test_write_collected_prompts_writes_files_and_updates_config(self) -> None:
         from tempfile import TemporaryDirectory
@@ -321,20 +370,151 @@ class PromptQueueTests(unittest.TestCase):
 
             self.assertEqual(config.completion_notify_session_id, "")
 
-    def test_render_status_marks_done_in_progress_pending_and_stop_next(self) -> None:
+    def test_render_status_shows_sectioned_dashboard(self) -> None:
         queue = [
             RunItem(index=1, prompt_name="first", prompt_text="one", prompt_source="test", command="cdx"),
             RunItem(index=2, prompt_name="second", prompt_text="two", prompt_source="test", command="cdx"),
             RunItem(index=3, prompt_name="third", prompt_text="three", prompt_source="test", command="cdx"),
         ]
 
-        status = render_status(queue, current_index=2, completed={1}, stop_after_current=True)
+        status = render_status(
+            queue,
+            current_index=2,
+            completed={1},
+            stop_after_current=True,
+            phase="agent working",
+            total_elapsed_seconds=3661,
+            prompt_elapsed_seconds=65,
+            last_check_at="2026-06-29T10:00:00",
+            last_check_line="Waiting for Ready",
+            prompt_durations={1: 30},
+            title="repo",
+        )
 
-        self.assertIn("first #1 ... V", status)
-        self.assertIn("second #2 ... in progress", status)
-        self.assertIn("third #3 ... queued", status)
-        self.assertIn("[S] stop after current: armed", status)
-        self.assertIn("[F] finish current wait", status)
+        self.assertIn("prompt-queue  repo", status)
+        self.assertIn("running  1h 1m 1s", status)
+        self.assertIn("Progress", status)
+        self.assertIn("done     1/3", status)
+        self.assertIn("current  002 second", status)
+        self.assertIn("left     1", status)
+        self.assertNotIn("Queue", status)
+        self.assertNotIn("[x] 001 first", status)
+        self.assertNotIn("[>] 002 second", status)
+        self.assertNotIn("[ ] 003 third", status)
+        self.assertIn("Current Prompt", status)
+        self.assertIn("phase       agent working", status)
+        self.assertIn("elapsed     1m 5s", status)
+        self.assertIn("last check  10:00:00", status)
+        self.assertIn("last line   Waiting for Ready", status)
+        self.assertIn("Controls", status)
+        self.assertIn("S stop after current    F finish wait    Q kill now", status)
+        self.assertNotIn("ETA", status)
+
+    def test_render_status_shows_total_and_current_prompt_elapsed_time(self) -> None:
+        queue = [
+            RunItem(index=1, prompt_name="first", prompt_text="one", prompt_source="test", command="cdx"),
+            RunItem(index=2, prompt_name="second", prompt_text="two", prompt_source="test", command="cdx"),
+        ]
+
+        status = render_status(
+            queue,
+            current_index=2,
+            completed={1},
+            stop_after_current=False,
+            phase="agent working",
+            total_elapsed_seconds=3661,
+            prompt_elapsed_seconds=65,
+        )
+
+        self.assertIn("running  1h 1m 1s", status)
+        self.assertIn("elapsed     1m 5s", status)
+
+    def test_render_prompt_list_compacts_large_queue_around_current_prompt(self) -> None:
+        queue = [
+            RunItem(index=index, prompt_name=f"prompt-{index}", prompt_text=str(index), prompt_source="test", command="cdx")
+            for index in range(1, 15)
+        ]
+
+        prompt_list = render_prompt_list(
+            queue,
+            current_index=6,
+            completed={1, 2, 3, 4, 5},
+            completed_window=3,
+            queued_window=4,
+        )
+
+        self.assertIn("Prompt List", prompt_list)
+        self.assertIn("... 2 completed prompts hidden", prompt_list)
+        self.assertNotIn("[x] 001 prompt-1", prompt_list)
+        self.assertIn("[x] 003 prompt-3", prompt_list)
+        self.assertIn("[>] 006 prompt-6", prompt_list)
+        self.assertIn("[ ] 010 prompt-10", prompt_list)
+        self.assertNotIn("[ ] 011 prompt-11", prompt_list)
+        self.assertIn("... 4 queued prompts hidden", prompt_list)
+
+    def test_render_prompt_list_shows_only_completed_durations(self) -> None:
+        queue = [
+            RunItem(index=1, prompt_name="first", prompt_text="one", prompt_source="test", command="cdx"),
+            RunItem(index=2, prompt_name="second", prompt_text="two", prompt_source="test", command="cdx"),
+        ]
+
+        prompt_list = render_prompt_list(
+            queue,
+            current_index=2,
+            completed={1},
+            prompt_durations={1: 30},
+            prompt_elapsed_seconds=65,
+        )
+
+        self.assertIn("[x] 001 first", prompt_list)
+        self.assertIn("30s", prompt_list)
+        self.assertIn("[>] 002 second", prompt_list)
+        self.assertNotIn("1m 5s", prompt_list)
+
+    def test_format_elapsed_uses_clock_style_for_long_runs(self) -> None:
+        self.assertEqual(format_elapsed(0), "0s")
+        self.assertEqual(format_elapsed(65), "1m 5s")
+        self.assertEqual(format_elapsed(3661), "1h 1m 1s")
+
+    def test_format_index_ranges_compacts_contiguous_indices(self) -> None:
+        self.assertEqual(format_index_ranges([]), "none")
+        self.assertEqual(format_index_ranges([1, 2, 3, 5, 7, 8]), "1-3,5,7-8")
+
+    def test_render_run_preflight_shows_resume_and_existing_session(self) -> None:
+        plan = RunPlan(
+            project_dir=Path("/repo"),
+            session="prompt-queue-repo",
+            prompt_count=23,
+            completed=[1, 2, 3, 4, 5],
+            pending=list(range(6, 24)),
+            resume_runtime_dir=Path("/repo/.planning/work/prompt-queue/20260629-120000"),
+            existing_session=True,
+        )
+
+        rendered = render_run_preflight(plan)
+
+        self.assertIn("target repo: /repo", rendered)
+        self.assertIn("queue: 23 prompts", rendered)
+        self.assertIn("resume source: /repo/.planning/work/prompt-queue/20260629-120000", rendered)
+        self.assertIn("completed: 1-5", rendered)
+        self.assertIn("will run: 6-23", rendered)
+        self.assertIn("existing tmux session: prompt-queue-repo", rendered)
+
+    def test_prompt_start_new_run_defaults_to_yes_and_rejects_no(self) -> None:
+        plan = RunPlan(
+            project_dir=Path("/repo"),
+            session="prompt-queue-repo",
+            prompt_count=1,
+            completed=[],
+            pending=[1],
+            resume_runtime_dir=None,
+            existing_session=False,
+        )
+
+        with mock.patch("builtins.input", return_value=""), mock.patch("builtins.print"):
+            self.assertTrue(prompt_start_new_run(plan))
+        with mock.patch("builtins.input", return_value="n"), mock.patch("builtins.print"):
+            self.assertFalse(prompt_start_new_run(plan))
 
     def test_should_stop_after_current_reads_flag_file(self) -> None:
         from tempfile import TemporaryDirectory
@@ -348,6 +528,41 @@ class PromptQueueTests(unittest.TestCase):
             (runtime_dir / "stop-next.flag").write_text("1")
 
             self.assertTrue(should_stop_after_current(runtime_dir))
+
+    def test_stop_after_current_flag_toggles(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            runtime_dir = Path(raw_dir) / "runtime"
+            runtime_dir.mkdir()
+
+            self.assertTrue(toggle_stop_after_current(runtime_dir))
+            self.assertTrue(should_stop_after_current(runtime_dir))
+
+            self.assertFalse(toggle_stop_after_current(runtime_dir))
+            self.assertFalse(should_stop_after_current(runtime_dir))
+
+    def test_stop_next_command_toggles_latest_runtime_flag(self) -> None:
+        from argparse import Namespace
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            project_dir = tmp_path / "repo"
+            runtime_dir = project_dir / ".planning/work/prompt-queue/20260629-120000"
+            runtime_dir.mkdir(parents=True)
+            (runtime_dir / "session.json").write_text("{}")
+            config_path = tmp_path / "config.json"
+            config_path.write_text(json.dumps({"project_dir": str(project_dir), "prompts": ["prompt"]}))
+            args = Namespace(config=str(config_path))
+
+            with mock.patch("builtins.print") as mocked_print:
+                stop_next(args)
+                stop_next(args)
+
+            self.assertFalse(should_stop_after_current(runtime_dir))
+            self.assertIn("armed stop-after-current", mocked_print.call_args_list[0].args[0])
+            self.assertIn("disarmed stop-after-current", mocked_print.call_args_list[1].args[0])
 
     def test_finish_current_sleep_flag_is_consumed(self) -> None:
         from tempfile import TemporaryDirectory
@@ -383,6 +598,13 @@ class PromptQueueTests(unittest.TestCase):
             command,
             'cdx resume \'session with \'"\'"\'quote\'"\'"\'\' "$(cat \'/tmp/recovery prompt.txt\')"',
         )
+
+    def test_build_prompt_list_watch_command_refreshes_prompt_list_file(self) -> None:
+        command = build_prompt_list_watch_command(Path("/tmp/runtime prompt-list.txt"))
+
+        self.assertIn("while true", command)
+        self.assertIn("cat '/tmp/runtime prompt-list.txt'", command)
+        self.assertIn("sleep 1", command)
 
     def test_paste_settle_seconds_scales_by_prompt_size(self) -> None:
         self.assertEqual(paste_settle_seconds(499), 1.5)
@@ -765,6 +987,247 @@ class PromptQueueTests(unittest.TestCase):
             (newer / "session.json").write_text("{}")
 
             self.assertEqual(latest_runtime_dir(project_dir), newer)
+
+    def test_resumable_completed_indices_reads_prior_state_when_queue_matches(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            config_path = tmp_path / "config.json"
+            runtime_dir = tmp_path / "runtime"
+            runtime_dir.mkdir()
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "prompts": [
+                            {"name": "first", "text": "Prompt one"},
+                            {"name": "second", "text": "Prompt two"},
+                        ]
+                    }
+                )
+            )
+            prompts = load_config(config_path).prompts
+            write_prompt_queue(runtime_dir / "queue.json", prompts)
+            (runtime_dir / "state.json").write_text(json.dumps({"completed": [1]}))
+
+            completed = read_resumable_completed_indices(runtime_dir, prompts)
+
+            self.assertEqual(completed, {1})
+
+    def test_resumable_completed_indices_ignores_changed_prompt_text(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            old_config_path = tmp_path / "old-config.json"
+            new_config_path = tmp_path / "new-config.json"
+            runtime_dir = tmp_path / "runtime"
+            runtime_dir.mkdir()
+            old_config_path.write_text(json.dumps({"prompts": [{"name": "first", "text": "Prompt one"}]}))
+            new_config_path.write_text(json.dumps({"prompts": [{"name": "first", "text": "Changed prompt"}]}))
+            old_prompts = load_config(old_config_path).prompts
+            new_prompts = load_config(new_config_path).prompts
+            write_prompt_queue(runtime_dir / "queue.json", old_prompts)
+            (runtime_dir / "state.json").write_text(json.dumps({"completed": [1]}))
+
+            completed = read_resumable_completed_indices(runtime_dir, new_prompts)
+
+            self.assertEqual(completed, set())
+
+    def test_controller_records_prompt_finish_progress_and_timing_log(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            config_path = tmp_path / "config.json"
+            config_path.write_text(json.dumps({"project_dir": "/tmp/project", "prompts": ["prompt"]}))
+            config = load_config(config_path, runtime_dir_override=tmp_path / "runtime")
+            controller = Controller(config, "session", "%1")
+            item = RunItem(index=1, prompt_name="prompt-1", prompt_text="prompt", prompt_source="test", command="cdx")
+            controller.completed = {1}
+            controller.current_prompt_started_at = 100.0
+            controller.current_prompt_started_wall_at = "2026-06-29T10:00:00"
+
+            with mock.patch.object(prompt_queue.time, "monotonic", return_value=165.25):
+                controller.record_prompt_finished(item, "complete")
+
+            progress = json.loads((config.runtime_dir / "progress.json").read_text())
+            timing_lines = (config.runtime_dir / "timings.jsonl").read_text().splitlines()
+            self.assertEqual(progress["completed"], [1])
+            self.assertEqual(progress["last_finished"]["run_index"], 1)
+            self.assertEqual(progress["last_finished"]["status"], "complete")
+            self.assertEqual(progress["last_finished"]["duration_seconds"], 65.25)
+            self.assertEqual(len(timing_lines), 1)
+            self.assertEqual(json.loads(timing_lines[0])["duration_seconds"], 65.25)
+
+    def test_run_one_keeps_worker_open_when_stop_after_current_is_armed(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        class FakeController(Controller):
+            def __init__(self, *args: object) -> None:
+                super().__init__(*args)
+                self.stop_calls = 0
+
+            def recycle_worker(self) -> None:
+                return None
+
+            def cd_worker(self) -> None:
+                return None
+
+            def send_shell_command(self, command: str) -> None:
+                return None
+
+            def sleep_with_controls(self, seconds: int, phase: str, ready_item: RunItem | None = None) -> str:
+                return "elapsed"
+
+            def wait_for_worker_ready(self, phase: str, ready_item: RunItem) -> str:
+                (self.config.runtime_dir / "stop-next.flag").write_text("1\n")
+                return "ready"
+
+            def capture_run(self, item: RunItem) -> Path:
+                path = self.config.runtime_dir / "capture.txt"
+                path.write_text("capture")
+                return path
+
+            def stop_worker(self) -> None:
+                self.stop_calls += 1
+
+            def render(self) -> None:
+                return None
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            config_path = tmp_path / "config.json"
+            config_path.write_text(json.dumps({"project_dir": "/tmp/project", "prompts": ["prompt"]}))
+            config = load_config(config_path, runtime_dir_override=tmp_path / "runtime")
+            controller = FakeController(config, "session", "%1")
+            controller.prompt_dir.mkdir(parents=True)
+            controller.capture_dir.mkdir(parents=True)
+            item = RunItem(index=1, prompt_name="prompt-1", prompt_text="prompt", prompt_source="test", command="cdx")
+
+            result = controller.run_one(item)
+
+            self.assertEqual(result, "complete")
+            self.assertEqual(controller.completed, {1})
+            self.assertEqual(controller.stop_calls, 0)
+
+    def test_run_one_stops_worker_after_completion_when_not_stopping(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        class FakeController(Controller):
+            def __init__(self, *args: object) -> None:
+                super().__init__(*args)
+                self.stop_calls = 0
+
+            def recycle_worker(self) -> None:
+                return None
+
+            def cd_worker(self) -> None:
+                return None
+
+            def send_shell_command(self, command: str) -> None:
+                return None
+
+            def sleep_with_controls(self, seconds: int, phase: str, ready_item: RunItem | None = None) -> str:
+                return "elapsed"
+
+            def wait_for_worker_ready(self, phase: str, ready_item: RunItem) -> str:
+                return "ready"
+
+            def capture_run(self, item: RunItem) -> Path:
+                path = self.config.runtime_dir / "capture.txt"
+                path.write_text("capture")
+                return path
+
+            def stop_worker(self) -> None:
+                self.stop_calls += 1
+
+            def render(self) -> None:
+                return None
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            config_path = tmp_path / "config.json"
+            config_path.write_text(json.dumps({"project_dir": "/tmp/project", "prompts": ["prompt"]}))
+            config = load_config(config_path, runtime_dir_override=tmp_path / "runtime")
+            controller = FakeController(config, "session", "%1")
+            controller.prompt_dir.mkdir(parents=True)
+            controller.capture_dir.mkdir(parents=True)
+            item = RunItem(index=1, prompt_name="prompt-1", prompt_text="prompt", prompt_source="test", command="cdx")
+
+            result = controller.run_one(item)
+
+            self.assertEqual(result, "complete")
+            self.assertEqual(controller.stop_calls, 1)
+
+    def test_start_session_attaches_when_existing_session_choice_is_attach(self) -> None:
+        from argparse import Namespace
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            project_dir = tmp_path / "repo"
+            project_dir.mkdir()
+            config_path = tmp_path / "config.json"
+            config_path.write_text(json.dumps({"project_dir": str(project_dir), "prompts": ["prompt"]}))
+            args = Namespace(config=str(config_path), cld=False, session="", no_attach=False)
+
+            with (
+                mock.patch.object(prompt_queue.shutil, "which", return_value="/usr/bin/tmux"),
+                mock.patch.object(prompt_queue, "tmux_session_exists", return_value=True),
+                mock.patch.object(prompt_queue, "prompt_existing_session_action", return_value="attach"),
+                mock.patch.object(prompt_queue, "attach_session") as attach_session,
+                mock.patch.object(prompt_queue, "kill_tmux_session_if_exists") as kill_session,
+            ):
+                prompt_queue.start_session(args)
+
+            attach_session.assert_called_once_with("prompt-queue-repo")
+            kill_session.assert_not_called()
+
+    def test_start_session_layout_places_controller_over_planner_and_prompt_list_over_worker(self) -> None:
+        from argparse import Namespace
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            project_dir = tmp_path / "repo"
+            project_dir.mkdir()
+            config_path = tmp_path / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "project_dir": str(project_dir),
+                        "blocked_recovery": True,
+                        "blocked_recovery_session_id": "planner-session",
+                        "prompts": ["prompt"],
+                    }
+                )
+            )
+            args = Namespace(config=str(config_path), cld=False, session="", no_attach=True)
+            calls: list[tuple[str, ...]] = []
+            pane_ids = iter(["%controller", "%prompt-list", "%planner", "%worker"])
+
+            def fake_tmux(*tmux_args: str, **kwargs: object) -> CompletedProcess[str]:
+                calls.append(tmux_args)
+                if tmux_args[0] in {"new-session", "split-window"}:
+                    return CompletedProcess(["tmux", *tmux_args], 0, next(pane_ids), "")
+                return CompletedProcess(["tmux", *tmux_args], 0, "", "")
+
+            with (
+                mock.patch.object(prompt_queue.shutil, "which", return_value="/usr/bin/tmux"),
+                mock.patch.object(prompt_queue, "tmux_session_exists", return_value=False),
+                mock.patch.object(prompt_queue.sys.stdin, "isatty", return_value=False),
+                mock.patch.object(prompt_queue, "tmux", side_effect=fake_tmux),
+                mock.patch("builtins.print"),
+            ):
+                prompt_queue.start_session(args)
+
+            split_calls = [call for call in calls if call[0] == "split-window"]
+            self.assertEqual(split_calls[0][1:4], ("-t", "%controller", "-h"))
+            self.assertIn("%controller", split_calls[1])
+            self.assertIn("-v", split_calls[1])
+            self.assertIn("%prompt-list", split_calls[2])
+            self.assertIn("-v", split_calls[2])
 
 
 if __name__ == "__main__":
