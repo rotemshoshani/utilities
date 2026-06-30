@@ -49,6 +49,25 @@ class AdvisorTests(unittest.TestCase):
         self.assertEqual(config.agents[0].prompt_delivery, "argument_file")
         self.assertEqual(config.agents[1].prompt_delivery, "paste")
 
+    def test_hygiene_preset_checks_reachability_and_cleanup(self) -> None:
+        config = load_config(Path(__file__).parents[1] / "config.json", topic_override="hygiene")
+        prompt = render_prompt(
+            config.prompt,
+            config,
+            RunItem(index=1, cycle=1, agent_name="codex", command="cdx"),
+        )
+
+        self.assertEqual(config.topic, "hygiene")
+        self.assertEqual(config.work_dir_name, "hygiene-advisor")
+        self.assertEqual(config.session_name, "hygiene-advisor")
+        self.assertEqual([agent.name for agent in config.agents], ["codex-Codex-default", "claude-Claude-default"])
+        self.assertIn("map the main reachable product surface", prompt)
+        self.assertIn("not reachable from navigation", prompt)
+        self.assertIn("duplicate or near-duplicate components", prompt)
+        self.assertIn("/.planning/work/hygiene-advisor", str(config.runtime_dir))
+        self.assertIn("hygiene-findings.md", prompt)
+        self.assertIn("cleanup-plan.md", prompt)
+
     def test_sec_preset_uses_sec_defaults(self) -> None:
         config = load_config(Path(__file__).parents[1] / "config.json", topic_override="sec")
 

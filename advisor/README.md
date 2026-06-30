@@ -3,9 +3,9 @@
 Unified advisor loop for repeated AI review passes.
 
 It replaces the duplicated `sec-advisor` and `arch-advisor` runners with one
-tmux controller and a launch wizard. The presets keep the existing security and
-architecture prompts, timings, work directories, and Codex-vs-Claude prompt
-delivery behavior.
+tmux controller and a launch wizard. The presets cover security, architecture,
+and hygiene review tasks with their own prompts, timings, work directories, and
+Codex-vs-Claude prompt delivery behavior.
 
 ## Usage
 
@@ -15,7 +15,7 @@ delivery behavior.
 
 The run command opens an `fzf`-style wizard:
 
-- choose a topic: `sec`, `arch`, or `custom`
+- choose a topic: `sec`, `arch`, `hygiene`, or `custom`
 - for `custom`, enter the task description
 - choose models from the generated list; each row shows `model | exact command`
 - optionally choose one reviewer model, or `none`
@@ -34,6 +34,7 @@ For the built-in presets, that means:
 ```bash
 <project>/.planning/work/sec-advisor/<timestamp>/
 <project>/.planning/work/arch-advisor/<timestamp>/
+<project>/.planning/work/hygiene-advisor/<timestamp>/
 ```
 
 The resolved run configuration is saved as:
@@ -100,6 +101,7 @@ For non-interactive default runs:
 
 ```bash
 ./advisor run --no-tui --topic arch ~/projects/my-app
+./advisor run --no-tui --topic hygiene ~/projects/my-app
 ```
 
 ## Controller Keys

@@ -458,7 +458,7 @@ def configured_work_dir_names(raw: dict[str, Any]) -> list[str]:
 
 
 def latest_runtime_dir(project_dir: Path, work_dir_names: list[str] | None = None) -> Path:
-    names = work_dir_names or ["advisor", "arch-advisor", "sec-advisor"]
+    names = work_dir_names or ["advisor", "arch-advisor", "hygiene-advisor", "sec-advisor"]
     candidates: list[Path] = []
     for name in names:
         base_dir = default_work_base_dir(project_dir, name)
@@ -1231,7 +1231,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="start or attach to an advisor tmux session")
     run.add_argument("project_dir", nargs="?", default="", help="repo path to review; overrides config.json project_dir")
     run.add_argument("--session", default="", help="override tmux session name")
-    run.add_argument("--topic", choices=["sec", "arch", "custom"], default="", help="topic for --no-tui runs")
+    run.add_argument("--topic", choices=["sec", "arch", "hygiene", "custom"], default="", help="topic for --no-tui runs")
     run.add_argument("--no-tui", action="store_true", help="skip fzf wizard and use config defaults")
     run.add_argument("--no-attach", action="store_true", help="create session without attaching")
     run.set_defaults(func=start_session)
