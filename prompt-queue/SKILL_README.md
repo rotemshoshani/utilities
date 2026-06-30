@@ -44,7 +44,7 @@ The skill should:
 - infer the target repo from the planning chat
 - write the target repo to `prompt-queue/.env.local`
 - write ordered prompt files under `prompt-queue/prompts/`
-- replace `prompt-queue/config.json`
+- replace `prompt-queue/config.local.json`
 - configure `cdx`, `argument_file`, `Ready` detection, and `DO-NOT-PROCEED` blocking
 - append the blocking instruction to every executor prompt
 - validate the JSON
@@ -93,7 +93,7 @@ Workflow:
 3. Write one markdown file per prompt under prompt-queue/prompts/.
 4. Write prompt-queue/.env.local with PROMPT_QUEUE_WORKDIR set to the target
    repo absolute path.
-5. Replace prompt-queue/config.json with project_dir "${PROMPT_QUEUE_WORKDIR}",
+5. Replace prompt-queue/config.local.json with project_dir "${PROMPT_QUEUE_WORKDIR}",
    command "cdx", prompt_delivery "argument_file", run_seconds 2700,
    ready_check_seconds 60, ready_check_lines 1, ready_markers ["Ready"],
    block_marker "DO-NOT-PROCEED", block_check_lines 10, prompts file

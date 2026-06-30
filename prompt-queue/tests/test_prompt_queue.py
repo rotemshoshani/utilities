@@ -17,6 +17,7 @@ from prompt_queue import (
     build_worker_cd_command,
     consume_finish_current_sleep,
     default_work_base_dir,
+    default_config_path,
     format_elapsed,
     format_index_ranges,
     kill_tmux_session_if_exists,
@@ -101,6 +102,24 @@ class PromptQueueTests(unittest.TestCase):
             config = load_config(config_path)
 
             self.assertEqual(config.project_dir, project_dir)
+
+    def test_default_config_prefers_ignored_local_config_when_present(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            default_path = tmp_path / "config.json"
+            local_path = tmp_path / "config.local.json"
+
+            with (
+                mock.patch.object(prompt_queue, "DEFAULT_CONFIG", default_path),
+                mock.patch.object(prompt_queue, "LOCAL_CONFIG", local_path),
+            ):
+                self.assertEqual(default_config_path(), default_path)
+                local_path.write_text("{}")
+                self.assertEqual(default_config_path(), local_path)
+                args = prompt_queue.build_parser().parse_args(["run", "--no-attach"])
+                self.assertEqual(args.config, str(local_path))
 
     def test_prompts_string_that_points_to_file_raises_clear_error(self) -> None:
         from tempfile import TemporaryDirectory

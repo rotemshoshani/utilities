@@ -23,7 +23,7 @@ Use deterministic names such as `001-phase-name.md`, `002-phase-name.md`.
 4. Write `prompt-queue/.env.local` so:
    - `PROMPT_QUEUE_WORKDIR` is the target repo absolute path.
    - `CODEX_THREAD_ID` is the current Codex session id, when available.
-5. Replace `prompt-queue/config.json` so:
+5. Replace `prompt-queue/config.local.json` so:
    - `project_dir` is `"${PROMPT_QUEUE_WORKDIR}"`.
    - `command` is `cdx`.
    - `prompt_delivery` is `argument_file`.
@@ -46,7 +46,7 @@ Use deterministic names such as `001-phase-name.md`, `002-phase-name.md`.
    - `completion_notify_check_lines` is `20`.
    - `prompts` is `[]`.
    - `prompt_files` references the files you wrote, in order, as paths relative
-     to `prompt-queue/config.json` such as `"prompts/001-phase-name.md"`.
+     to `prompt-queue/config.local.json` such as `"prompts/001-phase-name.md"`.
      Do not put prompt file paths in `prompts`; this local runner treats string
      entries in `prompts` as literal inline prompt text.
 6. Validate the JSON with `python3 -m json.tool`.

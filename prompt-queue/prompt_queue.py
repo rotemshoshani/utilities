@@ -18,6 +18,7 @@ from pathlib import Path
 
 
 DEFAULT_CONFIG = Path(__file__).with_name("config.json")
+LOCAL_CONFIG = Path(__file__).with_name("config.local.json")
 DEFAULT_ENV = Path(__file__).with_name(".env.local")
 STOP_NEXT_FLAG = "stop-next.flag"
 FINISH_SLEEP_FLAG = "finish-sleep.flag"
@@ -35,6 +36,10 @@ DEFAULT_CODEX_COMMAND = "cdx"
 DEFAULT_CLAUDE_COMMAND = "cld"
 DEFAULT_CODEX_PROMPT_DELIVERY = "argument_file"
 DEFAULT_CLAUDE_PROMPT_DELIVERY = "paste"
+
+
+def default_config_path() -> Path:
+    return LOCAL_CONFIG if LOCAL_CONFIG.exists() else DEFAULT_CONFIG
 
 
 @dataclass(frozen=True)
@@ -1550,7 +1555,7 @@ def start_session(args: argparse.Namespace) -> None:
     config_path = Path(args.config).expanduser().resolve()
     initial_config = apply_agent_override(load_config(config_path), args.cld)
     if not initial_config.prompts:
-        raise SystemExit("prompt-queue: configure prompts or prompt_files in config.json")
+        raise SystemExit(f"prompt-queue: configure prompts or prompt_files in {config_path.name}")
     if initial_config.blocked_recovery and not initial_config.blocked_recovery_session_id:
         raise SystemExit("prompt-queue: blocked_recovery requires blocked_recovery_session_id")
     if initial_config.completion_notify and not initial_config.completion_notify_session_id:
@@ -1817,7 +1822,11 @@ def collect_prompts(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="prompt-queue")
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="path to config.json")
+    parser.add_argument(
+        "--config",
+        default=str(default_config_path()),
+        help="path to config file; defaults to config.local.json when present, otherwise config.json",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     run = sub.add_parser("run", help="start or attach to the tmux prompt queue session")

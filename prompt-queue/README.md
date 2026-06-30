@@ -27,11 +27,15 @@ All run artifacts are written under the target repo:
 
 ## Usage
 
-Edit `.env.local` and `config.json`, then run:
+Edit `.env.local` and `config.local.json`, then run:
 
 ```bash
 ./prompt-queue run
 ```
+
+When `config.local.json` exists, prompt-queue uses it by default. That file is
+gitignored for machine-local queues, concrete Codex session ids, and active
+prompt lists. The tracked `config.json` stays as a reusable safe default.
 
 By default this runs Codex through `cdx`. To run the same queue through Claude
 instead, using `cld` and interactive paste delivery:
@@ -48,8 +52,8 @@ default is to attach to the existing session instead of replacing it.
 When a run starts, prompt-queue looks at the latest compatible run under the
 target repo's `.planning/work/prompt-queue/` directory. Completed prompts are
 skipped automatically, so if a tmux session exits or is stopped after prompt 5,
-the next `./prompt-queue run` starts from prompt 6 without editing
-`config.json`. Compatibility is checked against the saved `queue.json`,
+the next `./prompt-queue run` starts from prompt 6 without editing the config
+file. Compatibility is checked against the saved `queue.json`,
 including prompt content hashes, so a changed prompt is not skipped by stale
 progress.
 
@@ -61,8 +65,8 @@ To build the prompt queue interactively:
 
 For each prompt, paste the full text and finish it with a line containing only
 `::end`. When it asks for the next prompt, type `no more prompts`. The helper
-writes the prompts to `prompts/*.md` and updates `config.json` to reference
-those files.
+writes the prompts to `prompts/*.md` and updates the selected config file to
+reference those files. Use `--config config.local.json` for local queues.
 
 `.env.local` defines the repo the agent should run in:
 
@@ -70,7 +74,8 @@ those files.
 PROMPT_QUEUE_WORKDIR=/absolute/path/to/target-repo
 ```
 
-`config.json` defines the prompt queue and reads that working directory:
+`config.local.json` defines the active prompt queue and reads that working
+directory:
 
 ```jsonc
 {
@@ -96,12 +101,13 @@ For long prompts, prefer files under this `prompt-queue` directory:
 ```bash
 prompt-queue/
   config.json
+  config.local.json
   prompts/
     database.md
     frontend.md
 ```
 
-Prompt file paths are resolved relative to `config.json`.
+Prompt file paths are resolved relative to the selected config file.
 
 Reattach:
 
@@ -152,12 +158,12 @@ Focus the controller pane and press:
 
 ## Config
 
-Edit `.env.local` and `config.json`. They are the source of truth for:
+Edit `.env.local` and `config.local.json`. They are the source of truth for:
 
 - `.env.local` `PROMPT_QUEUE_WORKDIR`: repo the agent should run in
-- `config.json` `project_dir`: normally `${PROMPT_QUEUE_WORKDIR}`
+- `config.local.json` `project_dir`: normally `${PROMPT_QUEUE_WORKDIR}`
 - `prompts`: ordered queue of inline prompt objects
-- `prompt_files`: ordered queue of prompt files, resolved relative to `config.json`
+- `prompt_files`: ordered queue of prompt files, resolved relative to the selected config file
 
 The default command is `cdx`, which is expected to resolve through your shell
 alias. `./prompt-queue run --cld` overrides the command to `cld` and uses

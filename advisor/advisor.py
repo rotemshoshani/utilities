@@ -11,6 +11,7 @@ import subprocess
 import sys
 import termios
 import time
+import traceback
 import tty
 from dataclasses import dataclass
 from datetime import datetime
@@ -848,9 +849,31 @@ def run_controller(args: argparse.Namespace) -> None:
         tty.setcbreak(sys.stdin.fileno())
         controller = Controller(config, args.session, args.worker_pane)
         controller.run()
+        write_json(
+            config.runtime_dir / "controller-idle.json",
+            {
+                "pid": os.getpid(),
+                "session": args.session,
+                "phase": controller.phase,
+                "entered_idle_at": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
         while True:
             select.select([sys.stdin], [], [], 1)
             controller.handle_keyboard()
+    except BaseException as exc:
+        write_json(
+            config.runtime_dir / "controller-exit.json",
+            {
+                "pid": os.getpid(),
+                "session": args.session,
+                "exited_at": datetime.now().isoformat(timespec="seconds"),
+                "exception_type": type(exc).__name__,
+                "exception": str(exc),
+                "traceback": "".join(traceback.format_exception(exc)),
+            },
+        )
+        raise
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_attrs)
 
@@ -1140,6 +1163,7 @@ def start_session(args: argparse.Namespace) -> None:
     tmux("set-option", "-t", session, "status-position", "top")
     tmux("set-option", "-t", session, "status-left", f"#[fg=cyan,bold] {config.session_name} {config.project_dir.name} ")
     tmux("set-option", "-t", session, "status-right", "")
+    tmux("set-window-option", "-t", session, "remain-on-exit", "on")
 
     controller_cmd = (
         f"python3 {sh_quote(str(script))} "
